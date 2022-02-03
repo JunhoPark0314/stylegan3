@@ -125,7 +125,7 @@ def parse_comma_separated_list(s):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-f']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-f', 'stylegan3-v2']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -242,6 +242,10 @@ def main(**kwargs):
     elif opts.cfg == 'stylegan3-f':
         c.G_kwargs.class_name = 'training.networks_stylegan3_fourier_conv.Generator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
+    elif opts.cfg == 'stylegan3-v2':
+        c.G_kwargs.class_name = 'training.networks_stylegan3_ver2.Generator'
+        c.D_kwargs.class_name = 'training.networks_stylegan3_ver2.Discriminator'
+        c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))       
     else:
         c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
