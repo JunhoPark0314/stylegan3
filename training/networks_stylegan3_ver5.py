@@ -394,7 +394,8 @@ class SynthesisInput(torch.nn.Module):
 		phases = torch.rand([self.freq_channels]) - 0.5
 
 		# Setup parameters and buffers.
-		self.weight = torch.nn.Parameter(torch.randn([self.channels, self.freq_channels]))
+		freqs_gauss_mask = (-(freqs / self.max_bandwidth).norm(dim=-1)/2).exp() * (1 / np.sqrt(np.pi))
+		self.weight = torch.nn.Parameter(torch.randn([self.channels, self.freq_channels]) * freqs_gauss_mask.view(1, -1))
 		self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
 		self.effect_freq = (freqs.norm(dim=-1) < self.bandwidth).sum().float()
 		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
@@ -453,7 +454,7 @@ class SynthesisInput(torch.nn.Module):
 		x = x * amplitudes.unsqueeze(1).unsqueeze(2)
 
 		# Apply trainable mapping.
-		weight = self.weight / torch.sqrt(self.effect_freq)
+		weight = self.weight / np.sqrt(self.freq_channels)
 		x = x @ weight.t()
 
 		# Ensure correct shape.

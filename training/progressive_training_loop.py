@@ -229,17 +229,22 @@ def training_loop(
             phase.end_event = torch.cuda.Event(enable_timing=True)
 
     # Export sample images.
-    grid_size = None
-    grid_z = None
-    grid_c = None
+    grid_size_dict = {}
+    grid_z_dict = {}
+    grid_c_dict = {}
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set_dict[training_set_key[kid]])
-        save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
-        grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
-        grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
-        images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-        save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        for tsk in training_set_dict.keys():
+            grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set_dict[tsk])
+            save_image_grid(images, os.path.join(run_dir, f'reals_{tsk}.png'), drange=[0,255], grid_size=grid_size)
+            grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_size_per_key[tsk] // num_gpus)
+            grid_c = torch.from_numpy(labels).to(device).split(batch_size_per_key[tsk] // num_gpus)
+            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+            save_image_grid(images, os.path.join(run_dir, f'fakes_init_{tsk}.png'), drange=[-1,1], grid_size=grid_size)
+
+            grid_size_dict[tsk] = grid_size
+            grid_z_dict[tsk] = grid_z
+            grid_c_dict[tsk] = grid_c
 
     # Initialize logs.
     if rank == 0:
@@ -269,14 +274,22 @@ def training_loop(
     if progress_fn is not None:
         progress_fn(0, total_kimg)
     while True:
+
+        # Initialize training set with current target key 
+        ts_key = training_set_key[kid]
+        batch_size = batch_size_per_key[ts_key]
+        batch_gpu = batch_size // num_gpus
+        training_set = training_set_dict[ts_key]
+        training_set_iterator = training_set_iterator_dict[ts_key]
+
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator_dict[training_set_key[kid]])
+            phase_real_img, phase_real_c = next(training_set_iterator)
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
-            all_gen_c = [training_set_dict[training_set_key[kid]].get_label(np.random.randint(len(training_set_dict[training_set_key[kid]]))) for _ in range(len(phases) * batch_size)]
+            all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
@@ -292,7 +305,7 @@ def training_loop(
             phase.module.requires_grad_(True)
             for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
                 loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg, 
-                resolution=training_set_dict[training_set_key[kid]].resolution)
+                resolution=training_set.resolution)
             phase.module.requires_grad_(False)
 
             # Update weights.
@@ -343,14 +356,7 @@ def training_loop(
         
         if cur_tick % progress_term == progress_term - 1:
             kid += 1
-            if rank == 0 and kid != len(training_set_key):
-                grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set_dict[training_set_key[kid]])
-                grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
-                grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
             kid = min(kid, len(training_set_key) - 1)
-            batch_size = batch_size_per_key[training_set_key[kid]]
-            batch_gpu = batch_size // num_gpus
-
 
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
@@ -385,8 +391,9 @@ def training_loop(
 
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[training_set_key[kid]].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+            for tsk in training_set_key:
+                images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
 
         # Save network snapshot.
         snapshot_pkl = None
