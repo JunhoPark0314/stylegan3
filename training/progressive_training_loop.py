@@ -348,7 +348,8 @@ def training_loop(
                 grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
                 grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
             kid = min(kid, len(training_set_key) - 1)
-            batch_size = batch_size_per_key[kid]
+            batch_size = batch_size_per_key[training_set_key[kid]]
+            batch_gpu = batch_size // num_gpus
 
 
         # Perform maintenance tasks once per tick.

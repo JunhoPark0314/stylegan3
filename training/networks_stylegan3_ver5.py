@@ -396,10 +396,11 @@ class SynthesisInput(torch.nn.Module):
 		# Setup parameters and buffers.
 		self.weight = torch.nn.Parameter(torch.randn([self.channels, self.freq_channels]))
 		self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
+		self.effect_freq = (freqs.norm(dim=-1) < self.bandwidth).sum().float()
 		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
 		self.register_buffer('freqs', freqs)
 		self.register_buffer('phases', phases)
-		self.register_buffer('effect_freq', (freqs.norm(dim=-1) < self.bandwidth).sum().float())
+		# self.register_buffer('effect_freq', (freqs.norm(dim=-1) < self.bandwidth).sum().float())
 	
 	def init_size_hyper(self, 
 			size,
@@ -409,8 +410,8 @@ class SynthesisInput(torch.nn.Module):
 			self.size = np.broadcast_to(np.asarray(size), [2])
 			self.sampling_rate = sampling_rate
 			self.bandwidth = bandwidth
-			effect_freq = (self.freqs.norm(dim=-1) < self.bandwidth).sum().float()
-			self.register_buffer('effect_freq', effect_freq.to(self.effect_freq.device))
+			self.effect_freq = (self.freqs.norm(dim=-1) < self.bandwidth).sum().float()
+			# self.register_buffer('effect_freq', effect_freq.to(self.effect_freq.device))
 
 	def forward(self, w):
 

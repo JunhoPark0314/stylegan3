@@ -156,6 +156,7 @@ def parse_comma_separated_list(s):
 @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
 @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
 @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--pg-term',      help='When to increase progress learning', metavar='INT',       type=click.IntRange(min=1), default=300, show_default=True)
 
 # Misc settings.
 @click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
@@ -235,6 +236,7 @@ def main(data, **kwargs):
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
+    c.progress_term = opts.pg_term
 
     for k in c.training_set_kwargs.keys():
         c.training_set_kwargs[k].use_labels = opts.cond
