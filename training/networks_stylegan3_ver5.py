@@ -620,7 +620,7 @@ class SynthesisLayer(torch.nn.Module):
 		if self.is_torgb is False:
 			weight = self.weight_gen(x.device).type_as(x)
 			x = depthwise_demod_conv2d(x=x.to(dtype), w=weight, dilation=int(self.weight_gen.density),
-				padding=(self.conv_kernel//2)*2, demodulate=(not self.is_torgb), input_gain=input_gain)
+				padding=(self.conv_kernel//2)*2, demodulate=True, input_gain=None)
 		
 		x = modulated_conv2d(x=x.to(dtype), w=self.style_weight, s=styles,
 			padding=0, demodulate=(not self.is_torgb), input_gain=input_gain)
