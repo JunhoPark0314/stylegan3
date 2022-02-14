@@ -8,6 +8,8 @@
 
 """Tool for creating ZIP/PNG based datasets."""
 
+from collections import defaultdict
+from email.policy import default
 import functools
 import gzip
 import io
@@ -19,7 +21,7 @@ import sys
 import tarfile
 import zipfile
 from pathlib import Path
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import click
 import numpy as np
@@ -284,16 +286,27 @@ def open_dataset(source, *, max_images: Optional[int]):
 
 #----------------------------------------------------------------------------
 
-def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None], Callable[[], None]]:
+def open_dest(dest: str, resolution: Tuple) -> Tuple[str, list, Callable[[str, Union[bytes, str]], None], Callable[[], None]]:
     dest_ext = file_ext(dest)
 
     if dest_ext == 'zip':
         if os.path.dirname(dest) != '':
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-        zf = zipfile.ZipFile(file=dest, mode='w', compression=zipfile.ZIP_STORED)
-        def zip_write_bytes(fname: str, data: Union[bytes, str]):
+        dest_token = dest.split('.')[0]
+        zf_list = []
+
+        for res in resolution:
+            zf = zipfile.ZipFile(file=f'{dest_token}-{res[0]}x{res[1]}.zip', mode='w', compression=zipfile.ZIP_STORED)
+            zf_list.append(zf)
+
+        def zip_write_bytes(zf, fname: str, data: Union[bytes, str]):
             zf.writestr(fname, data)
-        return '', zip_write_bytes, zf.close
+        
+        def zip_close():
+            for zf in zf_list:
+                zf.close()
+
+        return '', zf_list, zip_write_bytes, zip_close
     else:
         # If the output folder already exists, check that is is
         # empty.
@@ -318,11 +331,11 @@ def open_dest(dest: str) -> Tuple[str, Callable[[str, Union[bytes, str]], None],
 
 @click.command()
 @click.pass_context
+@click.argument('resolution', metavar='WxH', type=parse_tuple, nargs=-1)
 @click.option('--source', help='Directory or archive name for input dataset', required=True, metavar='PATH')
 @click.option('--dest', help='Output directory or archive name for output dataset', required=True, metavar='PATH')
 @click.option('--max-images', help='Output only up to `max-images` images', type=int, default=None)
 @click.option('--transform', help='Input crop/resize mode', type=click.Choice(['center-crop', 'center-crop-wide']))
-@click.option('--resolution', help='Output resolution (e.g., \'512x512\')', metavar='WxH', type=parse_tuple)
 def convert_dataset(
     ctx: click.Context,
     source: str,
@@ -396,58 +409,61 @@ def convert_dataset(
         ctx.fail('--dest output filename or directory must not be an empty string')
 
     num_files, input_iter = open_dataset(source, max_images=max_images)
-    archive_root_dir, save_bytes, close_dest = open_dest(dest)
+    archive_root_dir, zf_list, save_bytes, close_dest = open_dest(dest, resolution)
 
     if resolution is None: resolution = (None, None)
-    transform_image = make_transform(transform, *resolution)
 
-    dataset_attrs = None
+    transform_image_list = [make_transform(transform, *res) for res in resolution]
 
+    dataset_attrs = defaultdict(dict)
     labels = []
     for idx, image in tqdm(enumerate(input_iter), total=num_files):
-        idx_str = f'{idx:08d}'
-        archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
+        for res_idx, (transform_image, zf) in enumerate(zip(transform_image_list, zf_list)):
+            idx_str = f'{idx:08d}'
+            archive_fname = f'{idx_str[:5]}/img{idx_str}.png'
 
-        # Apply crop and resize.
-        img = transform_image(image['img'])
+            # Apply crop and resize.
 
-        # Transform may drop images.
-        if img is None:
-            continue
+            img = transform_image(image['img'])
 
-        # Error check to require uniform image attributes across
-        # the whole dataset.
-        channels = img.shape[2] if img.ndim == 3 else 1
-        cur_image_attrs = {
-            'width': img.shape[1],
-            'height': img.shape[0],
-            'channels': channels
-        }
-        if dataset_attrs is None:
-            dataset_attrs = cur_image_attrs
-            width = dataset_attrs['width']
-            height = dataset_attrs['height']
-            if width != height:
-                error(f'Image dimensions after scale and crop are required to be square.  Got {width}x{height}')
-            if dataset_attrs['channels'] not in [1, 3]:
-                error('Input images must be stored as RGB or grayscale')
-            if width != 2 ** int(np.floor(np.log2(width))):
-                error('Image width/height after scale and crop are required to be power-of-two')
-        elif dataset_attrs != cur_image_attrs:
-            err = [f'  dataset {k}/cur image {k}: {dataset_attrs[k]}/{cur_image_attrs[k]}' for k in dataset_attrs.keys()] # pylint: disable=unsubscriptable-object
-            error(f'Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n' + '\n'.join(err))
+            # Transform may drop images.
+            if img is None:
+                continue
 
-        # Save the image as an uncompressed PNG.
-        img = PIL.Image.fromarray(img, { 1: 'L', 3: 'RGB' }[channels])
-        image_bits = io.BytesIO()
-        img.save(image_bits, format='png', compress_level=0, optimize=False)
-        save_bytes(os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
-        labels.append([archive_fname, image['label']] if image['label'] is not None else None)
+            # Error check to require uniform image attributes across
+            # the whole dataset.
+            channels = img.shape[2] if img.ndim == 3 else 1
+            cur_image_attrs = {
+                'width': img.shape[1],
+                'height': img.shape[0],
+                'channels': channels
+            }
+            if len(dataset_attrs[res_idx]) == 0:
+                dataset_attrs[res_idx] = cur_image_attrs
+                width = dataset_attrs[res_idx]['width']
+                height = dataset_attrs[res_idx]['height']
+                if width != height:
+                    error(f'Image dimensions after scale and crop are required to be square.  Got {width}x{height}')
+                if dataset_attrs[res_idx]['channels'] not in [1, 3]:
+                    error('Input images must be stored as RGB or grayscale')
+                if width != 2 ** int(np.floor(np.log2(width))):
+                    error('Image width/height after scale and crop are required to be power-of-two')
+            elif dataset_attrs[res_idx] != cur_image_attrs:
+                err = [f'  dataset {k}/cur image {k}: {dataset_attrs[res_idx][k]}/{cur_image_attrs[k]}' for k in dataset_attrs[res_idx].keys()] # pylint: disable=unsubscriptable-object
+                error(f'Image {archive_fname} attributes must be equal across all images of the dataset.  Got:\n' + '\n'.join(err))
+
+            # Save the image as an uncompressed PNG.
+            img = PIL.Image.fromarray(img, { 1: 'L', 3: 'RGB' }[channels])
+            image_bits = io.BytesIO()
+            img.save(image_bits, format='png', compress_level=0, optimize=False)
+            save_bytes(zf, os.path.join(archive_root_dir, archive_fname), image_bits.getbuffer())
+            labels.append([archive_fname, image['label']] if image['label'] is not None else None)
 
     metadata = {
         'labels': labels if all(x is not None for x in labels) else None
     }
-    save_bytes(os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
+    for zf in zf_list:
+        save_bytes(zf, os.path.join(archive_root_dir, 'dataset.json'), json.dumps(metadata))
     close_dest()
 
 #----------------------------------------------------------------------------

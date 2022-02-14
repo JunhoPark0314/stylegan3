@@ -70,12 +70,19 @@ def launch_training(c, desc, outdir, dry_run, loop_module):
     print(f'Number of GPUs:      {c.num_gpus}')
     print(f'Batch size:          {c.batch_size} images')
     print(f'Training duration:   {c.total_kimg} kimg')
-    print(f'Dataset path:        {c.training_set_kwargs.path}')
-    print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
-    print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
-    print(f'Dataset labels:      {c.training_set_kwargs.use_labels}')
-    print(f'Dataset x-flips:     {c.training_set_kwargs.xflip}')
-    print()
+
+    for k in c.training_set_kwargs.keys():
+        print(f'{k}')
+        print(f'Dataset path:        {c.training_set_kwargs[k].path}')
+        print(f'Dataset size:        {c.training_set_kwargs[k].max_size} images')
+        print(f'Dataset resolution:  {c.training_set_kwargs[k].resolution}')
+        print(f'Dataset labels:      {c.training_set_kwargs[k].use_labels}')
+        print(f'Dataset x-flips:     {c.training_set_kwargs[k].xflip}')
+        print()
+    
+    key_list = list(c.training_set_kwargs.keys())
+    c.init_img_res = c.training_set_kwargs[key_list[0]].resolution
+    c.max_img_res = c.training_set_kwargs[key_list[-1]].resolution
 
     # Dry run?
     if dry_run:
@@ -95,7 +102,7 @@ def launch_training(c, desc, outdir, dry_run, loop_module):
         if c.num_gpus == 1:
             subprocess_fn(rank=0, c=c, temp_dir=temp_dir, loop_module=loop_module)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus, loop_module=loop_module)
+            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir, loop_module), nprocs=c.num_gpus)
 
 #----------------------------------------------------------------------------
 
@@ -124,10 +131,10 @@ def parse_comma_separated_list(s):
 @click.command()
 
 # Required.
+@click.argument('data',         metavar='[ZIP|DIR]',                                            required=True, nargs=-1)
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
 @click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-sn', 'stylegan3-v1', 'stylegan3-v2', 'stylegan3-v3', 'stylegan3-v4', 'stylegan3-v5']), required=True)
 @click.option('--loop-module',  help='Training loop module',                                    type=click.Choice(['training_loop', 'progressive_training_loop']), required=True)
-@click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
 @click.option('--gamma',        help='R1 regularization weight', metavar='FLOAT',               type=click.FloatRange(min=0), required=True)
@@ -162,7 +169,7 @@ def parse_comma_separated_list(s):
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)
 @click.option('-n','--dry-run', help='Print training options and exit',                         is_flag=True)
 
-def main(**kwargs):
+def main(data, **kwargs):
     """Train a GAN using the techniques described in the paper
     "Alias-Free Generative Adversarial Networks".
 
@@ -195,12 +202,20 @@ def main(**kwargs):
     c.loss_kwargs = dnnlib.EasyDict(class_name='training.loss.StyleGAN2Loss')
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, prefetch_factor=2)
 
-    # Training set.
-    c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data)
+    # Training set. 
+
+    if 'progressive' in opts.loop_module:
+        whole_training_set_kwargs = dnnlib.EasyDict()
+        for data_ele in data:
+            training_set_kwargs, dataset_name_ele = init_dataset_kwargs(data=data_ele)
+            whole_training_set_kwargs[dataset_name_ele] = training_set_kwargs
+        c.training_set_kwargs = whole_training_set_kwargs
+        dataset_name = str.join('-', dataset_name_ele.split('-')[:-1])
+    else:
+        c.training_set_kwargs, dataset_name = init_dataset_kwargs(data=opts.data[0])
     if opts.cond and not c.training_set_kwargs.use_labels:
         raise click.ClickException('--cond=True requires labels specified in dataset.json')
-    c.training_set_kwargs.use_labels = opts.cond
-    c.training_set_kwargs.xflip = opts.mirror
+
 
     # Hyperparameters & settings.
     c.num_gpus = opts.gpus
@@ -218,9 +233,13 @@ def main(**kwargs):
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
-    c.random_seed = c.training_set_kwargs.random_seed = opts.seed
+    c.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
+    for k in c.training_set_kwargs.keys():
+        c.training_set_kwargs[k].use_labels = opts.cond
+        c.training_set_kwargs[k].xflip = opts.mirror
+        c.training_set_kwargs[k].random_seed = opts.seed
 
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:
@@ -266,9 +285,10 @@ def main(**kwargs):
         c.G_kwargs.class_name = 'training.networks_stylegan3_ver5.Generator'
         c.D_kwargs.class_name = 'training.networks_stylegan3_ver5.Discriminator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))  
-        c.G_kwargs.num_layers = 7
-        c.D_kwargs.num_layers = 7
-        c.D_kwargs.channel_base //= 8
+        c.G_kwargs.num_layers = 5
+        c.D_kwargs.num_layers = 4
+        c.D_kwargs.channel_base //= 4
+        c.G_kwargs.channel_base //= 8
     else:
         c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
