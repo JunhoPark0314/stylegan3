@@ -394,13 +394,14 @@ class SynthesisInput(torch.nn.Module):
 		phases = torch.rand([self.freq_channels]) - 0.5
 
 		# Setup parameters and buffers.
-		freqs_gauss_mask = (-(freqs / self.max_bandwidth).norm(dim=-1)/2).exp() * (1 / np.sqrt(np.pi))
-		self.weight = torch.nn.Parameter(torch.randn([self.channels, self.freq_channels]) * freqs_gauss_mask.view(1, -1))
+		self.weight = torch.nn.Parameter(torch.randn([self.channels, self.freq_channels]))
 		self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
 		self.effect_freq = (freqs.norm(dim=-1) < self.bandwidth).sum().float()
 		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
 		self.register_buffer('freqs', freqs)
 		self.register_buffer('phases', phases)
+		self.register_buffer('eff_mask', torch.ones_like(self.weight) * 0.001)
+		self.eff_mask[:,(self.freqs.norm(dim=-1) < self.bandwidth).nonzero()[:,0]] = 1
 		# self.register_buffer('effect_freq', (freqs.norm(dim=-1) < self.bandwidth).sum().float())
 	
 	def init_size_hyper(self, 
@@ -414,12 +415,17 @@ class SynthesisInput(torch.nn.Module):
 			self.effect_freq = (self.freqs.norm(dim=-1) < self.bandwidth).sum().float()
 			# self.register_buffer('effect_freq', effect_freq.to(self.effect_freq.device))
 
-	def forward(self, w):
+	def forward(self, w, update_emas=False):
 
 		# Introduce batch dimension and mask out unused bandwidth
 		transforms = self.transform.unsqueeze(0) # [batch, row, col]
 		freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
 		phases = self.phases.unsqueeze(0) # [batch, channel]
+
+		if update_emas:
+			curr_eff_mask = torch.ones_like(self.eff_mask) * 0.001
+			curr_eff_mask[:,(self.freqs.norm(dim=-1) < self.bandwidth).nonzero()[:,0]] = 1
+			self.eff_mask.copy_(self.eff_mask.lerp(curr_eff_mask, 0.999))
 
 		# Apply learned transformation.
 		t = self.affine(w) # t = (r_c, r_s, t_x, t_y)
@@ -454,7 +460,7 @@ class SynthesisInput(torch.nn.Module):
 		x = x * amplitudes.unsqueeze(1).unsqueeze(2)
 
 		# Apply trainable mapping.
-		weight = self.weight / np.sqrt(self.freq_channels)
+		weight = self.weight * self.eff_mask / np.sqrt(self.freq_channels)
 		x = x @ weight.t()
 
 		# Ensure correct shape.
@@ -781,9 +787,11 @@ class SynthesisNetwork(torch.nn.Module):
 			img_resolution = self.img_resolution * self.density
 
 		self.init_size_hyper(img_resolution)
+		if 'update_emas' not in layer_kwargs:
+			layer_kwargs['update_emas'] = True
 
 		# Execute layers.
-		x = self.input(ws[0])
+		x = self.input(ws[0], layer_kwargs['update_emas'])
 		for name, w in zip(self.layer_names, ws[1:]):
 			x = getattr(self, name)(x, w, **layer_kwargs)
 			# print("{:10s}: {:5f}, {:5f}".format(name, *torch.std_mean(x)))
