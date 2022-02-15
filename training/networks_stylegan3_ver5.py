@@ -221,6 +221,7 @@ class SynthesisKernel(torch.nn.Module):
 	def __init__(self,
 		out_dim,        # Number of output channels.
 		in_sampling_rate, 
+		max_sampling_rate,
 		init_size,
 		down_factor,
 		up_factor		= 1,
@@ -244,7 +245,7 @@ class SynthesisKernel(torch.nn.Module):
 		self.down_taps = self.filter_size
 		self.init_size = init_size
 		self.out_size = init_size
-		self.in_size = init_size
+		self.in_size = init_size * (max_sampling_rate // in_sampling_rate)
 		self.sigma = 1 / init_size
 		self.in_sampling_rate = in_sampling_rate
 		self.is_rgb = is_rgb
@@ -253,19 +254,12 @@ class SynthesisKernel(torch.nn.Module):
 	
 	def init_size_hyper(self, in_sampling_rate):
 		self.density = int(in_sampling_rate // self.in_sampling_rate)
-		# Use Odd size kernel only
-		# self.out_size = int((self.init_size * self.density - 1) // 2 * 2 + 1)
-		# self.out_size = 1 if self.is_rgb else (self.density // 4) * 2 + self.init_size 
-		self.in_size = self.density * self.init_size
 		self.out_size = self.density * self.init_size
-		# self.out_size = self.in_size
 		self.sigma = 1 / self.density
 
 		knots = np.arange(self.out_size) - self.out_size // 2
 		gauss_filter = torch.from_numpy(gauss_spline(knots, 5))
 		gauss_filter = (gauss_filter.view(1, -1) * gauss_filter.view(-1, 1)).sqrt() 
-		# gauss_filter /= gauss_filter.sum()
-		# gauss_filter *= (self.out_size**2)
 
 		if hasattr(self, 'gauss_filter'):
 			self.register_buffer('gauss_filter', gauss_filter.to(self.gauss_filter.device))
@@ -283,15 +277,18 @@ class SynthesisKernel(torch.nn.Module):
 		weight = self.generator(grids.flatten(0,2))
 		# weight = weight * (self.scale.view(1, 1, -1) / 10).sigmoid() * 2
 		weight = weight.view(1, int(self.in_size), int(self.in_size), self.out_dim).permute(3, 0, 1, 2)
-		# weight = torch.nn.functional.interpolate(weight, size=[int(self.out_size), int(self.out_size)], mode='bilinear', align_corners=True)
+		weight = torch.nn.functional.interpolate(weight, size=[int(self.out_size), int(self.out_size)], mode='bilinear', align_corners=True)
 
 		misc.assert_shape(weight, [self.out_dim, None, int(self.out_size), int(self.out_size)])
 
-		weight *= self.gauss_filter
 		weight = weight - weight.mean([1,2,3], keepdim=True)
-		weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt() * np.sqrt(2/3)
+		weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt()
+		weight *= self.gauss_filter
+		# weight /= weight.detach().std() * np.sqrt(2)
 
-		weight = torch.nn.PixelUnshuffle(self.density)(weight).view(-1, 1, self.init_size, self.init_size)
+
+		weight = torch.nn.PixelUnshuffle(self.density)(weight)
+		weight = weight.permute(1,0,2,3).reshape(-1, 1, self.init_size, self.init_size)
 
 		print("{:10s}: {:5f}, {:5f}".format('synthkernel', *torch.std_mean(weight))) if DEBUG else 1
 		return weight
@@ -475,6 +472,7 @@ class SynthesisLayer(torch.nn.Module):
 		out_size,                       # Output spatial size: int or [width, height].
 		in_sampling_rate,               # Input sampling rate (s).
 		out_sampling_rate,              # Output sampling rate (s).
+		max_sampling_rate,
 		in_cutoff,                      # Input cutoff frequency (f_c).
 		out_cutoff,                     # Output cutoff frequency (f_c).
 		in_half_width,                  # Input transition band half-width (f_h).
@@ -519,6 +517,7 @@ class SynthesisLayer(torch.nn.Module):
 		self.weight_gen = SynthesisKernel(
 			out_dim=self.in_channels,
 			in_sampling_rate=in_sampling_rate,
+			max_sampling_rate=max_sampling_rate,
 			init_size=conv_kernel,
 			down_factor=2
 		)
@@ -701,6 +700,7 @@ class SynthesisNetwork(torch.nn.Module):
 		# Compute channels based on maximum resolution 
 		max_conf = self.compute_band(max_img_resolution)
 		max_cutoffs = max_conf[1]
+		max_sampling_rates = max_conf[2]
 
 		channels = np.rint(np.minimum((channel_base / 2) / max_cutoffs, channel_max))
 		channels[-1] = self.img_channels
@@ -719,7 +719,7 @@ class SynthesisNetwork(torch.nn.Module):
 				w_dim=self.w_dim, is_torgb=is_torgb, is_critically_sampled=is_critically_sampled, use_fp16=use_fp16,
 				in_channels=int(channels[prev]), out_channels= int(channels[idx]),
 				in_size=int(sizes[prev]), out_size=int(sizes[idx]),
-				in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]),
+				in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]), max_sampling_rate=int(max_sampling_rates[idx]),
 				in_cutoff=cutoffs[prev], out_cutoff=cutoffs[idx],
 				in_half_width=half_widths[prev], out_half_width=half_widths[idx],
 				**layer_kwargs)
@@ -765,7 +765,8 @@ class SynthesisNetwork(torch.nn.Module):
 		if hasattr(self, 'min_sampling_rates'):
 			# For pixel shuffle
 			density = sampling_rates / self.min_sampling_rates
-			sizes += sizes % density
+			sizes -= sizes % density
+			assert ((sizes % density) == 0).all()
 
 		sizes[-2:] = img_resolution
 
@@ -841,6 +842,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		out_size,							# Size of output
 		in_sampling_rate,
 		out_sampling_rate,
+		max_sampling_rate,
 		in_cutoff,
 		out_cutoff,
 		in_half_width,
@@ -876,6 +878,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.conv0_gen = SynthesisKernel(
 			out_dim=self.in_channels,
 			in_sampling_rate=in_sampling_rate,
+			max_sampling_rate=max_sampling_rate,
 			init_size=conv_kernel,
 			down_factor=2
 		)
@@ -888,6 +891,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.conv1_gen = SynthesisKernel(
 			out_dim=self.out_channels,
 			in_sampling_rate=in_sampling_rate,
+			max_sampling_rate=max_sampling_rate,
 			init_size=conv_kernel,
 			down_factor=2
 		)
@@ -1170,6 +1174,7 @@ class Discriminator(torch.nn.Module):
 		
 		max_conf = self.compute_band(max_img_resolution)
 		max_cutoff = max_conf[1]
+		max_sampling_rates = max_conf[2]
 
 		channels = np.exp2(np.ceil(np.log2(np.minimum(channel_base // (max_cutoff*4) , channel_max)))).astype(np.int)
 		# channels = [int(min(np.rint(channel_base // 2 / cut), channel_max)) for cut in cutoffs]
@@ -1192,7 +1197,7 @@ class Discriminator(torch.nn.Module):
 			block = DiscriminatorBlock(in_channels, out_channels,
 				first_layer_idx=idx, use_fp16=use_fp16, 
 				in_size=int(sizes[prev]), out_size=int(sizes[idx]),
-				in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]),
+				in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]), max_sampling_rate=int(max_sampling_rates[idx]),
 				in_cutoff=cutoffs[prev], out_cutoff=cutoffs[idx],
 				in_half_width=half_widths[prev], out_half_width=half_widths[idx],
 				**block_kwargs, **common_kwargs)
@@ -1220,7 +1225,8 @@ class Discriminator(torch.nn.Module):
 		if hasattr(self, 'min_sampling_rates'):
 			# For pixel shuffle
 			density = sampling_rates / self.min_sampling_rates
-			sizes += sizes % density
+			sizes -= sizes % density
+			assert ((sizes % density) == 0).all()
 
 		sizes[-1] = self.out_resolution
 
