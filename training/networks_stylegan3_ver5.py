@@ -22,8 +22,9 @@ from torch_utils.ops import filtered_lrelu
 from torch_utils.ops import bias_act
 from torch_utils.ops import conv2d_resample
 from torch_utils.ops import upfirdn2d
-from torch_utils.ops.siren_pytorch import SirenNetIPE
+from torch_utils.ops.siren_pytorch import SirenNetIPE, SirenNet
 
+DEBUG=False
 
 #----------------------------------------------------------------------------
 def depthwise_demod_conv2d(
@@ -230,12 +231,11 @@ class SynthesisKernel(torch.nn.Module):
 		self.out_dim = out_dim
 		self.hidden_dim = 64
 		self.filter_size = filter_size
-		self.generator = SirenNetIPE(
+		self.generator = SirenNet(
 			dim_in = 2,
 			dim_hidden = self.hidden_dim,
 			dim_out = self.out_dim,
 			num_layers = 3,
-			w0_initial = 1,
 		)
 		self.scale = torch.nn.Parameter(torch.randn([self.out_dim]))
 		self.up_factor = up_factor
@@ -248,19 +248,22 @@ class SynthesisKernel(torch.nn.Module):
 		self.in_sampling_rate = in_sampling_rate
 		self.is_rgb = is_rgb
 		self.density = 1
+		self.test_weight = torch.nn.Parameter(torch.randn([self.out_dim, 1, self.out_size, self.out_size]) / np.sqrt(6))
 	
 	def init_size_hyper(self, in_sampling_rate):
 		self.density = int(in_sampling_rate // self.in_sampling_rate)
 		# Use Odd size kernel only
 		# self.out_size = int((self.init_size * self.density - 1) // 2 * 2 + 1)
 		self.out_size = 1 if self.is_rgb else (self.density // 4) * 2 + self.init_size 
-		self.in_size = self.density
+		# self.in_size = self.density * self.init_size
+		self.out_size = self.in_size
 		self.sigma = 1 / self.density
 
 		knots = np.arange(self.out_size) - self.out_size // 2
 		gauss_filter = torch.from_numpy(gauss_spline(knots, 5))
-		gauss_filter = (gauss_filter.view(1, -1) * gauss_filter.view(-1, 1)).sqrt() * 2
-		gauss_filter /= gauss_filter.sum()
+		gauss_filter = (gauss_filter.view(1, -1) * gauss_filter.view(-1, 1)).sqrt() 
+		# gauss_filter /= gauss_filter.sum()
+		# gauss_filter *= (self.out_size**2)
 
 		if hasattr(self, 'gauss_filter'):
 			self.register_buffer('gauss_filter', gauss_filter.to(self.gauss_filter.device))
@@ -268,26 +271,27 @@ class SynthesisKernel(torch.nn.Module):
 			self.register_buffer('gauss_filter', gauss_filter)
 	
 	def forward(self, device):
+		# return self.test_weight
 		# Construct sampling grid.
 		theta = torch.eye(2,3, device=device)
 		theta[0, 0] = 0.5 * self.in_size / self.out_size
 		theta[1, 1] = 0.5 * self.in_size / self.out_size
 		theta = theta.unsqueeze(0)
 		grids = torch.nn.functional.affine_grid(theta, [1, 1, int(self.in_size), int(self.in_size)], align_corners=False)
-		weight, _ = self.generator(mu=grids.flatten(0,2), sigma=self.sigma * torch.ones_like(grids.flatten(0,2), device=device))
-		weight = weight * (self.scale.view(1, 1, -1) / 10).sigmoid() * 2
+		weight = self.generator(grids.flatten(0,2))
+		# weight = weight * (self.scale.view(1, 1, -1) / 10).sigmoid() * 2
 		weight = weight.view(1, int(self.in_size), int(self.in_size), self.out_dim).permute(3, 0, 1, 2)
-		weight = torch.nn.functional.interpolate(weight, size=[int(self.out_size), int(self.out_size)], mode='bilinear', align_corners=True)
+		# weight = torch.nn.functional.interpolate(weight, size=[int(self.out_size), int(self.out_size)], mode='bilinear', align_corners=True)
 
 		misc.assert_shape(weight, [self.out_dim, None, int(self.out_size), int(self.out_size)])
 
-		# weight -= weight.mean()
-		weight *= self.gauss_filter * (1 / self.out_size ** 2) * 1.2
-
-		# weight *= (1 + 0.1 * self.out_size)
+		weight = weight - weight.mean([1,2,3], keepdim=True)
+		weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt() 
+		weight *= self.gauss_filter
 
 		# print(torch.std_mean(weight))
 		return weight
+
 	
 	def extra_repr(self):
 		return '\n'.join([
@@ -384,7 +388,6 @@ class SynthesisInput(torch.nn.Module):
 		# Setup parameters and buffers.
 		self.weight = torch.nn.Parameter(torch.randn([self.channels, self.freq_channels]))
 		self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
-		self.effect_freq = (freqs.norm(dim=-1) < self.bandwidth).sum().float()
 		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
 		self.register_buffer('freqs', freqs)
 		self.register_buffer('phases', phases)
@@ -657,7 +660,7 @@ class SynthesisNetwork(torch.nn.Module):
 		w_dim,                          # Intermediate latent (W) dimensionality.
 		img_resolution,                 # Output image resolution.
 		img_channels,                   # Number of color channels.
-		max_img_resolution  = 512,
+		max_img_resolution  = 256,
 		channel_base        = 32768,    # Overall multiplier for the number of channels.
 		channel_max         = 512,      # Maximum number of channels in any layer.
 		num_layers          = 14,       # Total number of layers, excluding Fourier features and ToRGB.
@@ -668,7 +671,7 @@ class SynthesisNetwork(torch.nn.Module):
 		margin_size			= 10,
 		output_scale        = 0.25,     # Scale factor for the output image.
 		num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
-		freq_channels       = 1024,
+		freq_channels       = 512,
 		**layer_kwargs,                 # Arguments for SynthesisLayer.
 	):
 		super().__init__()
@@ -726,6 +729,7 @@ class SynthesisNetwork(torch.nn.Module):
 		self.density = density
 
 		stopbands, cutoffs, sampling_rates, half_widths, sizes = self.compute_band(img_resolution)
+		sizes[0] += (density % 4 != 0)
 
 		self.input.init_size_hyper(size=int(sizes[0]), sampling_rate=int(sampling_rates[0]), bandwidth=cutoffs[0])
 
@@ -769,7 +773,7 @@ class SynthesisNetwork(torch.nn.Module):
 		x = self.input(ws[0])
 		for name, w in zip(self.layer_names, ws[1:]):
 			x = getattr(self, name)(x, w, **layer_kwargs)
-			# print("{:10s}: {:5f}, {:5f}".format(name, *torch.std_mean(x)))
+			print("{:10s}: {:5f}, {:5f}".format(name, *torch.std_mean(x))) if DEBUG else 1
 		if self.output_scale != 1:
 			x = x * self.output_scale
 
@@ -777,7 +781,7 @@ class SynthesisNetwork(torch.nn.Module):
 		misc.assert_shape(x, [None, self.img_channels, self.img_resolution * self.density, self.img_resolution * self.density])
 		x = x.to(torch.float32)
 
-		# print("{:10s}: {:5f}, {:5f}".format("G_out", *torch.std_mean(x)))
+		print("{:10s}: {:5f}, {:5f}".format("G_out", *torch.std_mean(x))) if DEBUG else 1
 		return x
 
 	def extra_repr(self):
@@ -1111,16 +1115,16 @@ class Discriminator(torch.nn.Module):
 		img_resolution,                 # Input resolution.
 		img_channels,                   # Number of input color channels.
 		max_img_resolution	= 512,
-		out_resolution      = 4,        # Output resolution.
+		out_resolution      = 8,        # Output resolution.
 		architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
 		channel_base        = 32768,    # Overall multiplier for the number of channels.
 		channel_max         = 512,      # Maximum number of channels in any layer.
 		num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
 		conv_clamp          = 256,      # Clamp the output of convolution layers to +-X, None = disable clamping.
 		cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
-		last_cutoff         = 2**2,     # Cutoff frequency of the first layer
-		last_stopband       = 2**3.1,   # Minimum stopband of the first layer
-		first_stopband_rel   = 2**0.3,   # Minimum stopband of the last layer, expressed relative to the cutoff
+		last_cutoff         = 2**1,     # Cutoff frequency of the first layer
+		last_stopband       = 2**2.1,   # Minimum stopband of the first layer
+		first_stopband_rel   = 2**-0.3,   # Minimum stopband of the last layer, expressed relative to the cutoff
 		num_layers          = 6,        # Number of layers
 		margin_size         = 10,
 		block_kwargs        = {},       # Arguments for DiscriminatorBlock.
@@ -1190,7 +1194,7 @@ class Discriminator(torch.nn.Module):
 		stopbands = first_stopband * (self.last_stopband / first_stopband) ** exponents
 
 		# Compute remaining layer parameters
-		sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, img_resolution))))
+		sampling_rates = np.exp2(np.ceil(np.log2(np.maximum(stopbands * 2, self.out_resolution))))
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs
 		margin_size = np.clip((np.rint(np.log2(first_cutoff // self.last_cutoff)) - 2) * 3, a_min=0, a_max=self.margin_size)
 		sizes = sampling_rates + margin_size * 2
@@ -1227,13 +1231,13 @@ class Discriminator(torch.nn.Module):
 		for layer_name in self.layer_name:
 			block = getattr(self, layer_name)
 			x, img = block(x, img, **block_kwargs)
-			# print("{:10s}: {:5f}, {:5f}".format(layer_name, *torch.std_mean(x)))
+			print("{:10s}: {:5f}, {:5f}".format(layer_name, *torch.std_mean(x))) if DEBUG else 1
 
 		cmap = None
 		if self.c_dim > 0:
 			cmap = self.mapping(None, c)
 
-		# print("{:10s}: {:5f}, {:5f}".format("logits", *torch.std_mean(x)))
+		print("{:10s}: {:5f}, {:5f}".format("logits", *torch.std_mean(x))) if DEBUG else 1
 		x = self.b_ep(x, img, cmap)
 		return x
 

@@ -24,7 +24,7 @@ class Sine(nn.Module):
 # siren layer
 
 class SirenIPE(nn.Module):
-    def __init__(self, dim_in, dim_out, w0 = 1., c = 6., is_first = False, use_bias = True, activation = None):
+    def __init__(self, dim_in, dim_out, w0 = 1., c = 6., is_first = False, use_bias = True, activation = None, use_sigma=True):
         super().__init__()
         self.dim_in = dim_in
         self.is_first = is_first
@@ -37,6 +37,7 @@ class SirenIPE(nn.Module):
         self.weight = nn.Parameter(weight)
         self.bias = nn.Parameter(bias) if use_bias else None
         self.activation = Sine(w0) if activation is None else activation
+        self.use_sigma = is_first or use_sigma
 
     def init_(self, weight, bias, c, w0):
         dim = self.dim_in
@@ -52,8 +53,12 @@ class SirenIPE(nn.Module):
             tmp_mu = self.w0 * F.linear(mu, self.weight, self.bias)
             tmp_sigma = self.w0 * F.linear(sigma, self.weight) 
 
-            sin_mu = torch.sin(tmp_mu) * (1 - 0.5 * (tmp_sigma **2))
-            sin_sigma = (torch.cos(tmp_mu) * tmp_sigma) ** 2 - 0.25 * (torch.sin(tmp_mu) * (tmp_sigma**2)) ** 2
+            if self.use_sigma:
+                sin_mu = torch.sin(tmp_mu) * (1 - 0.5 * (tmp_sigma **2))
+                sin_sigma = (torch.cos(tmp_mu) * tmp_sigma) ** 2 - 0.25 * (torch.sin(tmp_mu) * (tmp_sigma**2)) ** 2
+            else:
+                sin_mu = torch.sin(tmp_mu)
+                sin_sigma = tmp_sigma
             return sin_mu, sin_sigma
         else:
             tmp_mu = self.w0 * F.linear(mu, self.weight, self.bias)
@@ -128,7 +133,7 @@ class SirenNet(nn.Module):
 # siren network
 
 class SirenNetIPE(nn.Module):
-    def __init__(self, dim_in, dim_hidden, dim_out, num_layers, w0 = 1., w0_initial = 30., use_bias = True, final_activation = None):
+    def __init__(self, dim_in, dim_hidden, dim_out, num_layers, w0 = 1., w0_initial = 30., use_bias = True, final_activation = None, input_only=False):
         super().__init__()
         self.num_layers = num_layers
         self.dim_hidden = dim_hidden
@@ -144,11 +149,12 @@ class SirenNetIPE(nn.Module):
                 dim_out = dim_hidden,
                 w0 = layer_w0,
                 use_bias = use_bias,
-                is_first = is_first
+                is_first = is_first,
+                use_sigma = input_only
             ))
 
         final_activation = nn.Identity() if not exists(final_activation) else final_activation
-        self.last_layer = SirenIPE(dim_in = dim_hidden, dim_out = dim_out, w0 = w0, use_bias = False, activation = final_activation)
+        self.last_layer = SirenIPE(dim_in = dim_hidden, dim_out = dim_out, w0 = w0, use_bias = False, activation = final_activation, use_sigma=input_only)
 
     def forward(self, mu, sigma):
         for layer in self.layers:

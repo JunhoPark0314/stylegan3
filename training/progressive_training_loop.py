@@ -30,8 +30,8 @@ from metrics import metric_main
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    gw = np.clip(1920 // training_set.image_shape[2], 7, 32)
+    gh = np.clip(1080 // training_set.image_shape[1], 4, 32)
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
@@ -180,12 +180,12 @@ def training_loop(
 
     # Print network summary tables.
     if rank == 0:
-        # for bs_test, train_set in zip(batch_size_per_key.values(), training_set_dict.values()):
-        bs_test = batch_size_per_key[training_set_key[0]]
-        z = torch.randn([bs_test, G.z_dim], device=device)
-        c = torch.randn([bs_test, G.c_dim], device=device)
-        img = misc.print_module_summary(G, [z, c])
-        misc.print_module_summary(D, [img, c])
+        for bs_test, train_set in zip(batch_size_per_key.values(), training_set_dict.values()):
+            # bs_test = batch_size_per_key[training_set]
+            z = torch.randn([bs_test, G.z_dim], device=device)
+            c = torch.randn([bs_test, G.c_dim], device=device)
+            img = misc.print_module_summary(G, [z, c, train_set.resolution])
+            misc.print_module_summary(D, [img, c, train_set.resolution])
         # img = G(z, c, training_set_dict[training_set_key[0]].resolution)        
         # D(img, c, training_set_dict[training_set_key[0]].resolution)        
     # Hi Junho Park ????
@@ -399,8 +399,9 @@ def training_loop(
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             for tsk in training_set_key:
-                images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
-                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
+                if training_set_dict[tsk].resolution <= training_set.resolution:
+                    images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
+                    save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
 
         # Save network snapshot.
         snapshot_pkl = None
