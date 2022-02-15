@@ -180,10 +180,33 @@ def training_loop(
 
     # Print network summary tables.
     if rank == 0:
-        z = torch.empty([batch_gpu, G.z_dim], device=device)
-        c = torch.empty([batch_gpu, G.c_dim], device=device)
+        # for bs_test, train_set in zip(batch_size_per_key.values(), training_set_dict.values()):
+        bs_test = batch_size_per_key[training_set_key[0]]
+        z = torch.randn([bs_test, G.z_dim], device=device)
+        c = torch.randn([bs_test, G.c_dim], device=device)
         img = misc.print_module_summary(G, [z, c])
         misc.print_module_summary(D, [img, c])
+        # img = G(z, c, training_set_dict[training_set_key[0]].resolution)        
+        # D(img, c, training_set_dict[training_set_key[0]].resolution)        
+    # Hi Junho Park ????
+
+    # Export sample images.
+    grid_size_dict = {}
+    grid_z_dict = {}
+    grid_c_dict = {}
+    if rank == 0:
+        print('Exporting sample images...')
+        for tsk in training_set_dict.keys():
+            grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set_dict[tsk])
+            save_image_grid(images, os.path.join(run_dir, f'reals_{tsk}.png'), drange=[0,255], grid_size=grid_size)
+            grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_size_per_key[tsk] // num_gpus)
+            grid_c = torch.from_numpy(labels).to(device).split(batch_size_per_key[tsk] // num_gpus)
+            # images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+            # save_image_grid(images, os.path.join(run_dir, f'fakes_init_{tsk}.png'), drange=[-1,1], grid_size=grid_size)
+
+            grid_size_dict[tsk] = grid_size
+            grid_z_dict[tsk] = grid_z
+            grid_c_dict[tsk] = grid_c
 
     # Setup augmentation.
     if rank == 0:
@@ -228,23 +251,7 @@ def training_loop(
             phase.start_event = torch.cuda.Event(enable_timing=True)
             phase.end_event = torch.cuda.Event(enable_timing=True)
 
-    # Export sample images.
-    grid_size_dict = {}
-    grid_z_dict = {}
-    grid_c_dict = {}
-    if rank == 0:
-        print('Exporting sample images...')
-        for tsk in training_set_dict.keys():
-            grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set_dict[tsk])
-            save_image_grid(images, os.path.join(run_dir, f'reals_{tsk}.png'), drange=[0,255], grid_size=grid_size)
-            grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_size_per_key[tsk] // num_gpus)
-            grid_c = torch.from_numpy(labels).to(device).split(batch_size_per_key[tsk] // num_gpus)
-            images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(run_dir, f'fakes_init_{tsk}.png'), drange=[-1,1], grid_size=grid_size)
 
-            grid_size_dict[tsk] = grid_size
-            grid_z_dict[tsk] = grid_z
-            grid_c_dict[tsk] = grid_c
 
     # Initialize logs.
     if rank == 0:

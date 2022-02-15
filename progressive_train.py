@@ -287,10 +287,14 @@ def main(data, **kwargs):
         c.G_kwargs.class_name = 'training.networks_stylegan3_ver5.Generator'
         c.D_kwargs.class_name = 'training.networks_stylegan3_ver5.Discriminator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))  
-        c.G_kwargs.num_layers = 5
-        c.D_kwargs.num_layers = 4
-        c.D_kwargs.channel_base //= 4
-        c.G_kwargs.channel_base //= 8
+        c.G_kwargs.conv_kernel = 1
+        c.D_kwargs.block_kwargs.conv_kernel = 1
+
+        c.G_kwargs.num_layers = 11
+        c.D_kwargs.num_layers = 6
+
+        c.G_kwargs.first_cutoff = 2 ** 2.9
+        c.G_kwargs.first_stopband = 2 ** 4
     else:
         c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))

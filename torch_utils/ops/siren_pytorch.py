@@ -23,6 +23,44 @@ class Sine(nn.Module):
 
 # siren layer
 
+class SirenIPE(nn.Module):
+    def __init__(self, dim_in, dim_out, w0 = 1., c = 6., is_first = False, use_bias = True, activation = None):
+        super().__init__()
+        self.dim_in = dim_in
+        self.is_first = is_first
+        self.w0 = w0
+
+        weight = torch.zeros(dim_out, dim_in)
+        bias = torch.zeros(dim_out) if use_bias else None
+        self.init_(weight, bias, c = c, w0 = w0)
+
+        self.weight = nn.Parameter(weight)
+        self.bias = nn.Parameter(bias) if use_bias else None
+        self.activation = Sine(w0) if activation is None else activation
+
+    def init_(self, weight, bias, c, w0):
+        dim = self.dim_in
+
+        w_std = (1 / dim) if self.is_first else (math.sqrt(c / dim) / w0)
+        weight.uniform_(-w_std, w_std)
+
+        if exists(bias):
+            bias.uniform_(-w_std, w_std)
+
+    def forward(self, mu, sigma):
+        if isinstance(self.activation, Sine):
+            tmp_mu = self.w0 * F.linear(mu, self.weight, self.bias)
+            tmp_sigma = self.w0 * F.linear(sigma, self.weight) 
+
+            sin_mu = torch.sin(tmp_mu) * (1 - 0.5 * (tmp_sigma **2))
+            sin_sigma = (torch.cos(tmp_mu) * tmp_sigma) ** 2 - 0.25 * (torch.sin(tmp_mu) * (tmp_sigma**2)) ** 2
+            return sin_mu, sin_sigma
+        else:
+            tmp_mu = self.w0 * F.linear(mu, self.weight, self.bias)
+            return tmp_mu, None
+
+# siren layer
+
 class Siren(nn.Module):
     def __init__(self, dim_in, dim_out, w0 = 1., c = 6., is_first = False, use_bias = True, activation = None):
         super().__init__()
@@ -86,6 +124,37 @@ class SirenNet(nn.Module):
                 x *= rearrange(mod, 'd -> () d')
 
         return self.last_layer(x)
+
+# siren network
+
+class SirenNetIPE(nn.Module):
+    def __init__(self, dim_in, dim_hidden, dim_out, num_layers, w0 = 1., w0_initial = 30., use_bias = True, final_activation = None):
+        super().__init__()
+        self.num_layers = num_layers
+        self.dim_hidden = dim_hidden
+
+        self.layers = nn.ModuleList([])
+        for ind in range(num_layers):
+            is_first = ind == 0
+            layer_w0 = w0_initial if is_first else w0
+            layer_dim_in = dim_in if is_first else dim_hidden
+
+            self.layers.append(SirenIPE(
+                dim_in = layer_dim_in,
+                dim_out = dim_hidden,
+                w0 = layer_w0,
+                use_bias = use_bias,
+                is_first = is_first
+            ))
+
+        final_activation = nn.Identity() if not exists(final_activation) else final_activation
+        self.last_layer = SirenIPE(dim_in = dim_hidden, dim_out = dim_out, w0 = w0, use_bias = False, activation = final_activation)
+
+    def forward(self, mu, sigma):
+        for layer in self.layers:
+            mu, sigma = layer(mu, sigma)
+
+        return self.last_layer(mu, sigma)
 
 # modulatory feed forward
 
