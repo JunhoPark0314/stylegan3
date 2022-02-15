@@ -24,12 +24,13 @@ from torch_utils.ops import conv2d_resample
 from torch_utils.ops import upfirdn2d
 from torch_utils.ops.siren_pytorch import SirenNetIPE, SirenNet
 
-DEBUG=False
+DEBUG=True
 
 #----------------------------------------------------------------------------
 def depthwise_demod_conv2d(
 	x,
 	w,
+	groups		= 1,
 	demodulate  = True,
 	padding     = 0,
 	input_gain  = None,
@@ -38,7 +39,7 @@ def depthwise_demod_conv2d(
 	batch_size = int(x.shape[0])
 	in_channels = int(x.shape[1])
 	out_channels, _, kh, kw = w.shape
-	misc.assert_shape(w, [out_channels, 1, kh, kw]) # [OIkk]
+	misc.assert_shape(w, [out_channels, -1, kh, kw]) # [OIkk]
 	misc.assert_shape(x, [batch_size, in_channels, None, None]) # [NIHW]
 
 	if input_gain is not None:
@@ -46,7 +47,7 @@ def depthwise_demod_conv2d(
 		w = w * input_gain.unsqueeze(-1).unsqueeze(-1) # [OIkk]
 	
 	# Execute as one fused op using grouped convolution.
-	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=in_channels, dilation=dilation)
+	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=groups, dilation=dilation)
 	return x
 
 @misc.profiled_function
@@ -254,9 +255,10 @@ class SynthesisKernel(torch.nn.Module):
 		self.density = int(in_sampling_rate // self.in_sampling_rate)
 		# Use Odd size kernel only
 		# self.out_size = int((self.init_size * self.density - 1) // 2 * 2 + 1)
-		self.out_size = 1 if self.is_rgb else (self.density // 4) * 2 + self.init_size 
-		# self.in_size = self.density * self.init_size
-		self.out_size = self.in_size
+		# self.out_size = 1 if self.is_rgb else (self.density // 4) * 2 + self.init_size 
+		self.in_size = self.density * self.init_size
+		self.out_size = self.density * self.init_size
+		# self.out_size = self.in_size
 		self.sigma = 1 / self.density
 
 		knots = np.arange(self.out_size) - self.out_size // 2
@@ -285,11 +287,13 @@ class SynthesisKernel(torch.nn.Module):
 
 		misc.assert_shape(weight, [self.out_dim, None, int(self.out_size), int(self.out_size)])
 
-		weight = weight - weight.mean([1,2,3], keepdim=True)
-		weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt() 
 		weight *= self.gauss_filter
+		weight = weight - weight.mean([1,2,3], keepdim=True)
+		weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt() * np.sqrt(2/3)
 
-		# print(torch.std_mean(weight))
+		weight = torch.nn.PixelUnshuffle(self.density)(weight).view(-1, 1, self.init_size, self.init_size)
+
+		print("{:10s}: {:5f}, {:5f}".format('synthkernel', *torch.std_mean(weight))) if DEBUG else 1
 		return weight
 
 	
@@ -570,11 +574,11 @@ class SynthesisLayer(torch.nn.Module):
 
 			# TODO: Change here to weight_gen layer
 			self.weight_gen.init_size_hyper(in_sampling_rate=self.in_sampling_rate)
-			self.conv_kernel = self.weight_gen.out_size
+			self.conv_kernel = self.weight_gen.init_size
 
 			# Compute padding.
 			pad_total = (self.out_size - 1) * self.down_factor + 1 # Desired output size before downsampling.
-			pad_total -= (self.in_size + (self.conv_kernel//2) * 2) * self.up_factor # Input size after upsampling.
+			pad_total -= (self.in_size - (self.conv_kernel - 1) * self.weight_gen.density) * self.up_factor # Input size after upsampling.
 			pad_total += self.up_taps + self.down_taps - 2 # Size reduction caused by the filters.
 			pad_lo = (pad_total + self.up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
 			pad_hi = pad_total - pad_lo
@@ -602,8 +606,10 @@ class SynthesisLayer(torch.nn.Module):
 		dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
 		weight = self.weight_gen(x.device).type_as(x)
-		x = depthwise_demod_conv2d(x=x.to(dtype), w=weight,
-			padding=(self.conv_kernel//2)*2, demodulate=True, input_gain=None)
+
+		x = torch.nn.PixelUnshuffle(self.weight_gen.density)(x)
+		x = depthwise_demod_conv2d(x=x.to(dtype), w=weight, groups=x.shape[1], demodulate=True, input_gain=None)
+		x = torch.nn.PixelShuffle(self.weight_gen.density)(x)
 		
 		x = modulated_conv2d(x=x.to(dtype), w=self.style_weight, s=styles,
 			padding=0, demodulate=(not self.is_torgb), input_gain=input_gain)
@@ -690,6 +696,7 @@ class SynthesisNetwork(torch.nn.Module):
 		self.density = 1
 
 		stopbands, cutoffs, sampling_rates, half_widths, sizes = self.compute_band(self.img_resolution)
+		self.min_sampling_rates = sampling_rates
 
 		# Compute channels based on maximum resolution 
 		max_conf = self.compute_band(max_img_resolution)
@@ -729,7 +736,7 @@ class SynthesisNetwork(torch.nn.Module):
 		self.density = density
 
 		stopbands, cutoffs, sampling_rates, half_widths, sizes = self.compute_band(img_resolution)
-		sizes[0] += (density % 4 != 0)
+		# sizes[0] += (density % 4 != 0)
 
 		self.input.init_size_hyper(size=int(sizes[0]), sampling_rate=int(sampling_rates[0]), bandwidth=cutoffs[0])
 
@@ -755,6 +762,11 @@ class SynthesisNetwork(torch.nn.Module):
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
 		margin_size = np.clip((np.rint(np.log2(last_cutoff // self.first_cutoff)) - 1) * 3, a_min=0, a_max=self.margin_size)
 		sizes = sampling_rates + margin_size * 2
+		if hasattr(self, 'min_sampling_rates'):
+			# For pixel shuffle
+			density = sampling_rates / self.min_sampling_rates
+			sizes += sizes % density
+
 		sizes[-2:] = img_resolution
 
 		return stopbands, cutoffs, sampling_rates, half_widths, sizes
@@ -842,7 +854,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		use_fp16            = False,        # Use FP16 for this block?
 		fp16_channels_last  = False,        # Use channels-last memory format with FP16?
 		freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
-		filter_size			= 6
+		filter_size			= 3
 	):
 		assert architecture in ['orig', 'skip', 'resnet']
 		super().__init__()
@@ -855,7 +867,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.channels_last = (use_fp16 and fp16_channels_last)
 		self.num_layers = 0
 		self.conv_clamp = conv_clamp
-		self.filter_size = 6
+		self.filter_size = filter_size
 
 		if first_layer_idx == 0 or architecture == 'skip':
 			self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1,
@@ -949,19 +961,19 @@ class DiscriminatorBlock(torch.nn.Module):
 
 			self.conv0_gen.init_size_hyper(in_sampling_rate=in_sampling_rate)
 			self.conv1_gen.init_size_hyper(in_sampling_rate=in_sampling_rate)
-			self.conv_kernel = self.conv0_gen.out_size
+			self.conv_kernel = self.conv0_gen.init_size
 
 			# Compute padding.
 
-			pad_total = (self.in_size - 1) * self.up_factor + 1 # Desired output size before downsampling.
-			pad_total -= (self.in_size + ((self.conv_kernel // 2) * 2)) * self.up_factor # Input size after upsampling.
+			pad_total = (self.in_size - 1 + (self.conv_kernel - 1) * self.conv0_gen.density) * self.up_factor + 1 # Desired output size before downsampling.
+			pad_total -= (self.in_size - (self.conv_kernel - 1) * self.conv0_gen.density) * self.up_factor # Input size after upsampling.
 			pad_total += self.up_taps + self.up_taps - 2 # Size reduction caused by the filters.
 			pad_lo = (pad_total + self.up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
 			pad_hi = pad_total - pad_lo
 			self.padding0 = [int(pad_lo[0]), int(pad_hi[0]), int(pad_lo[1]), int(pad_hi[1])]
 
 			pad_total = (self.out_size - 1) * self.down_factor + 1 # Desired output size before downsampling.
-			pad_total -= (self.in_size + ((self.conv_kernel // 2) * 2)) * self.up_factor # Input size after upsampling.
+			pad_total -= (self.in_size) * self.up_factor # Input size after upsampling.
 			pad_total += self.down_taps + self.up_taps - 2 # Size reduction caused by the filters.
 			pad_lo = (pad_total + self.up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
 			pad_hi = pad_total - pad_lo
@@ -991,21 +1003,26 @@ class DiscriminatorBlock(torch.nn.Module):
 		if self.architecture == 'resnet':
 			y = self.skip(x, gain=np.sqrt(0.5))
 			w0 = self.conv0_gen(x.device).type_as(x)
-			x = conv2d_gradfix.conv2d(input=x, weight=w0, padding=((self.conv_kernel//2)*2), groups=self.in_channels)
+
+			x = torch.nn.PixelUnshuffle(self.conv0_gen.density)(x)
+			x = conv2d_gradfix.conv2d(input=x, weight=w0, groups=x.shape[1])
+			x = torch.nn.PixelShuffle(self.conv0_gen.density)(x)
+
 			x = self.conv0_point(x)
 			x = filtered_lrelu.filtered_lrelu(x=x, fu=self.up_filter, fd=self.up_filter, b=self.conv0_bias.type_as(x), 
 											  up=self.up_factor, down=self.up_factor, padding=self.padding0, clamp=self.conv_clamp, gain=np.sqrt(2), slope=0.2)
 
 			w1 = self.conv1_gen(x.device).type_as(x)
-			x = conv2d_gradfix.conv2d(input=x, weight=w1, padding=(self.conv_kernel//2)*2, groups=self.out_channels)
-			x = self.conv1_point(x)
+			x = torch.nn.PixelUnshuffle(self.conv1_gen.density)(x)
+			x = conv2d_gradfix.conv2d(input=x, weight=w1, groups=x.shape[1])
+			x = torch.nn.PixelShuffle(self.conv1_gen.density)(x)
 
-			y = torch.nn.functional.pad(y, [(self.conv_kernel)//2]*4)
+			x = self.conv1_point(x)
 			x = y.add_(x)
 
 			x = filtered_lrelu.filtered_lrelu(x=x, fu=self.up_filter, fd=self.down_filter, b=self.conv1_bias.type_as(x), 
 											  up=self.up_factor, down=self.down_factor, padding=self.padding1, clamp=self.conv_clamp)
-			x *= (1 / np.sqrt(2))
+			# x *= (1 / np.sqrt(2))
 
 		else:
 			x = self.conv0(x)
@@ -1145,6 +1162,7 @@ class Discriminator(torch.nn.Module):
 
 		self.stopbands = stopbands
 		self.cutoffs = cutoffs
+		self.min_sampling_rates = sampling_rates
 
 		self.sizes = sizes
 		self.img_channels = img_channels
@@ -1198,6 +1216,12 @@ class Discriminator(torch.nn.Module):
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs
 		margin_size = np.clip((np.rint(np.log2(first_cutoff // self.last_cutoff)) - 2) * 3, a_min=0, a_max=self.margin_size)
 		sizes = sampling_rates + margin_size * 2
+
+		if hasattr(self, 'min_sampling_rates'):
+			# For pixel shuffle
+			density = sampling_rates / self.min_sampling_rates
+			sizes += sizes % density
+
 		sizes[-1] = self.out_resolution
 
 		return stopbands, cutoffs, sampling_rates, half_widths, sizes

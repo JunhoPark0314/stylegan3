@@ -165,7 +165,8 @@ def training_loop(
     # Construct networks.
     if rank == 0:
         print('Constructing networks...')
-    common_kwargs = dict(c_dim=training_set_dict[training_set_key[0]].label_dim, img_resolution=training_set_dict[training_set_key[0]].resolution, img_channels=training_set_dict[training_set_key[0]].num_channels)
+    common_kwargs = dict(c_dim=training_set_dict[training_set_key[0]].label_dim, img_resolution=training_set_dict[training_set_key[0]].resolution, img_channels=training_set_dict[training_set_key[0]].num_channels,
+                                max_img_resolution=training_set_dict[training_set_key[-1]].resolution)
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     G_ema = copy.deepcopy(G).eval()
@@ -399,9 +400,9 @@ def training_loop(
         # Save image snapshot.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             for tsk in training_set_key:
-                if training_set_dict[tsk].resolution <= training_set.resolution:
-                    images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
-                    save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
+                # if training_set_dict[tsk].resolution <= training_set.resolution:
+                images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
 
         # Save network snapshot.
         snapshot_pkl = None
