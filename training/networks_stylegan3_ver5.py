@@ -33,6 +33,7 @@ def depthwise_demod_conv2d(
 	groups		= 1,
 	demodulate  = True,
 	padding     = 0,
+	stride		= 1,
 	input_gain  = None,
 	dilation	= 1,
 ):
@@ -47,7 +48,7 @@ def depthwise_demod_conv2d(
 		w = w * input_gain.unsqueeze(-1).unsqueeze(-1) # [OIkk]
 	
 	# Execute as one fused op using grouped convolution.
-	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=groups, dilation=dilation)
+	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=groups, dilation=dilation, stride=stride)
 	return x
 
 @misc.profiled_function
@@ -238,6 +239,7 @@ class SynthesisKernel(torch.nn.Module):
 			dim_hidden = self.hidden_dim,
 			dim_out = self.out_dim,
 			num_layers = 3,
+			w0_initial = 1,
 		)
 		self.scale = torch.nn.Parameter(torch.randn([self.out_dim]))
 		self.up_factor = up_factor
@@ -245,26 +247,31 @@ class SynthesisKernel(torch.nn.Module):
 		self.down_taps = self.filter_size
 		self.init_size = init_size
 		self.out_size = init_size
-		self.in_size = init_size * (max_sampling_rate // in_sampling_rate)
+		self.in_size = init_size 
 		self.sigma = 1 / init_size
 		self.in_sampling_rate = in_sampling_rate
+		self.max_sampling_rate = max_sampling_rate
 		self.is_rgb = is_rgb
 		self.density = 1
 		self.test_weight = torch.nn.Parameter(torch.randn([self.out_dim, 1, self.out_size, self.out_size]) / np.sqrt(6))
+
+		gauss_size = int(self.max_sampling_rate / self.in_sampling_rate) * self.init_size
+		knots = np.arange(gauss_size) - gauss_size // 2
+		gauss_filter = torch.from_numpy(gauss_spline(knots, gauss_size))
+		gauss_filter = (gauss_filter.view(1, -1) * gauss_filter.view(-1, 1)).sqrt()
+		gauss_filter /= gauss_filter.std() * 2
+		self.register_buffer('gauss_filter', gauss_filter.view(1,1,gauss_size, gauss_size))
+
+		# if hasattr(self, 'gauss_filter'):
+		# 	self.register_buffer('gauss_filter', gauss_filter.to(self.gauss_filter.device))
+		# else:
 	
 	def init_size_hyper(self, in_sampling_rate):
-		self.density = int(in_sampling_rate // self.in_sampling_rate)
-		self.out_size = self.density * self.init_size
-		self.sigma = 1 / self.density
-
-		knots = np.arange(self.out_size) - self.out_size // 2
-		gauss_filter = torch.from_numpy(gauss_spline(knots, 5))
-		gauss_filter = (gauss_filter.view(1, -1) * gauss_filter.view(-1, 1)).sqrt() 
-
-		if hasattr(self, 'gauss_filter'):
-			self.register_buffer('gauss_filter', gauss_filter.to(self.gauss_filter.device))
-		else:
-			self.register_buffer('gauss_filter', gauss_filter)
+		if self.init_size != 1:
+			self.density = int(in_sampling_rate // self.in_sampling_rate)
+			self.out_size = self.density * self.init_size
+			self.in_size = self.density * self.init_size
+			self.sigma = 1 / self.density
 	
 	def forward(self, device):
 		# return self.test_weight
@@ -274,21 +281,24 @@ class SynthesisKernel(torch.nn.Module):
 		theta[1, 1] = 0.5 * self.in_size / self.out_size
 		theta = theta.unsqueeze(0)
 		grids = torch.nn.functional.affine_grid(theta, [1, 1, int(self.in_size), int(self.in_size)], align_corners=False)
+		# weight, _ = self.generator(mu=grids.flatten(0,2), sigma=torch.ones_like(grids.flatten(0, 2), device=device))
 		weight = self.generator(grids.flatten(0,2))
 		# weight = weight * (self.scale.view(1, 1, -1) / 10).sigmoid() * 2
 		weight = weight.view(1, int(self.in_size), int(self.in_size), self.out_dim).permute(3, 0, 1, 2)
-		weight = torch.nn.functional.interpolate(weight, size=[int(self.out_size), int(self.out_size)], mode='bilinear', align_corners=True)
+		# weight = torch.nn.functional.interpolate(weight, size=[int(self.out_size), int(self.out_size)], mode='bilinear', align_corners=True)
 
 		misc.assert_shape(weight, [self.out_dim, None, int(self.out_size), int(self.out_size)])
 
-		weight = weight - weight.mean([1,2,3], keepdim=True)
-		weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt()
-		weight *= self.gauss_filter
+		# weight *= torch.nn.functional.interpolate(self.gauss_filter, size=[self.out_size, self.out_size], mode='bilinear', align_corners=False)
+		if self.out_size > 1:
+			weight = weight - weight.mean([1,2,3], keepdim=True)
+			weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt()
+		# weight *= self.gauss_filter * 3
 		# weight /= weight.detach().std() * np.sqrt(2)
 
 
-		weight = torch.nn.PixelUnshuffle(self.density)(weight)
-		weight = weight.permute(1,0,2,3).reshape(-1, 1, self.init_size, self.init_size)
+		# weight = torch.nn.PixelUnshuffle(self.density)(weight)
+		# weight = weight.permute(1,0,2,3).reshape(-1, 1, self.init_size, self.init_size)
 
 		print("{:10s}: {:5f}, {:5f}".format('synthkernel', *torch.std_mean(weight))) if DEBUG else 1
 		return weight
@@ -518,7 +528,7 @@ class SynthesisLayer(torch.nn.Module):
 			out_dim=self.in_channels,
 			in_sampling_rate=in_sampling_rate,
 			max_sampling_rate=max_sampling_rate,
-			init_size=conv_kernel,
+			init_size=1 if is_torgb else conv_kernel,
 			down_factor=2
 		)
 
@@ -577,7 +587,7 @@ class SynthesisLayer(torch.nn.Module):
 
 			# Compute padding.
 			pad_total = (self.out_size - 1) * self.down_factor + 1 # Desired output size before downsampling.
-			pad_total -= (self.in_size - (self.conv_kernel - 1) * self.weight_gen.density) * self.up_factor # Input size after upsampling.
+			pad_total -= (self.in_size) * self.up_factor # Input size after upsampling.
 			pad_total += self.up_taps + self.down_taps - 2 # Size reduction caused by the filters.
 			pad_lo = (pad_total + self.up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
 			pad_hi = pad_total - pad_lo
@@ -605,16 +615,21 @@ class SynthesisLayer(torch.nn.Module):
 		dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
 		weight = self.weight_gen(x.device).type_as(x)
+		B, C, H, W = x.shape
+		unfold_x = torch.nn.functional.unfold(input=x, kernel_size=self.weight_gen.out_size, stride=self.weight_gen.density)
+		unfold_x = torch.einsum('bks,k->bks',unfold_x, weight.flatten()) / (2)
+		x = torch.nn.functional.fold(input=unfold_x, kernel_size=self.weight_gen.out_size, stride=self.weight_gen.density, output_size=(H, W))
 
-		x = torch.nn.PixelUnshuffle(self.weight_gen.density)(x)
-		x = depthwise_demod_conv2d(x=x.to(dtype), w=weight, groups=x.shape[1], demodulate=True, input_gain=None)
-		x = torch.nn.PixelShuffle(self.weight_gen.density)(x)
+		# x = torch.nn.PixelUnshuffle(self.weight_gen.density)(x)
+		# x = depthwise_demod_conv2d(x=x.to(dtype), w=weight, groups=x.shape[1], demodulate=True, input_gain=None)
+		# x = torch.nn.PixelShuffle(self.weight_gen.density)(x)
 		
+		gain = 1 if self.is_torgb else np.sqrt(2)
 		x = modulated_conv2d(x=x.to(dtype), w=self.style_weight, s=styles,
 			padding=0, demodulate=(not self.is_torgb), input_gain=input_gain)
 
 		# Execute bias, filtered leaky ReLU, and clamping.
-		gain = 1 if self.is_torgb else np.sqrt(2)
+		# gain = 1 if self.is_torgb else np.sqrt(2)
 		slope = 1 if self.is_torgb else 0.2
 		x = filtered_lrelu.filtered_lrelu(x=x, fu=self.up_filter, fd=self.down_filter, b=self.bias.to(x.dtype),
 			up=self.up_factor, down=self.down_factor, padding=self.padding, gain=gain, slope=slope, clamp=self.conv_clamp)
@@ -760,13 +775,13 @@ class SynthesisNetwork(torch.nn.Module):
 		# Compute remaining layer parameters.
 		sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, img_resolution)))) # s[i]
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
-		margin_size = np.clip((np.rint(np.log2(last_cutoff // self.first_cutoff)) - 1) * 3, a_min=0, a_max=self.margin_size)
+		margin_size = np.clip((np.rint(np.log2(last_cutoff // self.first_cutoff))) * 5, a_min=0, a_max=self.margin_size*2)
 		sizes = sampling_rates + margin_size * 2
-		if hasattr(self, 'min_sampling_rates'):
-			# For pixel shuffle
-			density = sampling_rates / self.min_sampling_rates
-			sizes -= sizes % density
-			assert ((sizes % density) == 0).all()
+		# if hasattr(self, 'min_sampling_rates'):
+		# 	# For pixel shuffle
+		# 	density = sampling_rates / self.min_sampling_rates
+		# 	sizes -= sizes % density
+		# 	assert ((sizes % density) == 0).all()
 
 		sizes[-2:] = img_resolution
 
@@ -969,8 +984,8 @@ class DiscriminatorBlock(torch.nn.Module):
 
 			# Compute padding.
 
-			pad_total = (self.in_size - 1 + (self.conv_kernel - 1) * self.conv0_gen.density) * self.up_factor + 1 # Desired output size before downsampling.
-			pad_total -= (self.in_size - (self.conv_kernel - 1) * self.conv0_gen.density) * self.up_factor # Input size after upsampling.
+			pad_total = (self.in_size - 1) * self.up_factor + 1 # Desired output size before downsampling.
+			pad_total -= (self.in_size) * self.up_factor # Input size after upsampling.
 			pad_total += self.up_taps + self.up_taps - 2 # Size reduction caused by the filters.
 			pad_lo = (pad_total + self.up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
 			pad_hi = pad_total - pad_lo
@@ -1008,18 +1023,22 @@ class DiscriminatorBlock(torch.nn.Module):
 			y = self.skip(x, gain=np.sqrt(0.5))
 			w0 = self.conv0_gen(x.device).type_as(x)
 
-			x = torch.nn.PixelUnshuffle(self.conv0_gen.density)(x)
-			x = conv2d_gradfix.conv2d(input=x, weight=w0, groups=x.shape[1])
-			x = torch.nn.PixelShuffle(self.conv0_gen.density)(x)
+			B, C, H, W = x.shape
+			unfold_x = torch.nn.functional.unfold(input=x, kernel_size=self.conv0_gen.out_size, stride=self.conv0_gen.density)
+			unfold_x = torch.einsum('bks,k->bks',unfold_x, w0.flatten())
+			x = torch.nn.functional.fold(input=unfold_x, kernel_size=self.conv0_gen.out_size, stride=self.conv0_gen.density, output_size=(H, W))
+			x *= self.conv0_gen.density 
 
 			x = self.conv0_point(x)
 			x = filtered_lrelu.filtered_lrelu(x=x, fu=self.up_filter, fd=self.up_filter, b=self.conv0_bias.type_as(x), 
 											  up=self.up_factor, down=self.up_factor, padding=self.padding0, clamp=self.conv_clamp, gain=np.sqrt(2), slope=0.2)
 
 			w1 = self.conv1_gen(x.device).type_as(x)
-			x = torch.nn.PixelUnshuffle(self.conv1_gen.density)(x)
-			x = conv2d_gradfix.conv2d(input=x, weight=w1, groups=x.shape[1])
-			x = torch.nn.PixelShuffle(self.conv1_gen.density)(x)
+			B, C, H, W = x.shape
+			unfold_x = torch.nn.functional.unfold(input=x, kernel_size=self.conv1_gen.out_size, stride=self.conv1_gen.density)
+			unfold_x = torch.einsum('bks,k->bks',unfold_x, w1.flatten())
+			x = torch.nn.functional.fold(input=unfold_x, kernel_size=self.conv1_gen.out_size, stride=self.conv1_gen.density, output_size=(H, W))
+			x *= self.conv1_gen.density 
 
 			x = self.conv1_point(x)
 			x = y.add_(x)
@@ -1219,14 +1238,14 @@ class Discriminator(torch.nn.Module):
 		# Compute remaining layer parameters
 		sampling_rates = np.exp2(np.ceil(np.log2(np.maximum(stopbands * 2, self.out_resolution))))
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs
-		margin_size = np.clip((np.rint(np.log2(first_cutoff // self.last_cutoff)) - 2) * 3, a_min=0, a_max=self.margin_size)
+		margin_size = np.clip((np.rint(np.log2(first_cutoff // self.last_cutoff))) * 4, a_min=0, a_max=self.margin_size*2)
 		sizes = sampling_rates + margin_size * 2
 
-		if hasattr(self, 'min_sampling_rates'):
-			# For pixel shuffle
-			density = sampling_rates / self.min_sampling_rates
-			sizes -= sizes % density
-			assert ((sizes % density) == 0).all()
+		# if hasattr(self, 'min_sampling_rates'):
+		# 	# For pixel shuffle
+		# 	density = sampling_rates / self.min_sampling_rates
+		# 	sizes -= sizes % density
+		# 	assert ((sizes % density) == 0).all()
 
 		sizes[-1] = self.out_resolution
 

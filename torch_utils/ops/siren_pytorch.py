@@ -126,7 +126,8 @@ class SirenNet(nn.Module):
             x = layer(x)
 
             if exists(mod):
-                x *= rearrange(mod, 'd -> () d')
+                x = torch.einsum('bgc,bc->bgc',x,mod)
+                # x *= rearrange(mod, 'd -> () d')
 
         return self.last_layer(x)
 

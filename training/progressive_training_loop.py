@@ -181,12 +181,12 @@ def training_loop(
 
     # Print network summary tables.
     if rank == 0:
+        min_batch = batch_size_per_key[training_set_key[-1]]
+        z_test = torch.randn([min_batch, G.z_dim], device=device)
+        c_test = torch.randn([min_batch, G.c_dim], device=device)
         for bs_test, train_set in zip(batch_size_per_key.values(), training_set_dict.values()):
-            # bs_test = batch_size_per_key[training_set]
-            z = torch.randn([bs_test, G.z_dim], device=device)
-            c = torch.randn([bs_test, G.c_dim], device=device)
-            img = misc.print_module_summary(G, [z, c, train_set.resolution])
-            misc.print_module_summary(D, [img, c, train_set.resolution])
+            img = misc.print_module_summary(G, [z_test, c_test, train_set.resolution])
+            misc.print_module_summary(D, [img, c_test, train_set.resolution])
         # img = G(z, c, training_set_dict[training_set_key[0]].resolution)        
         # D(img, c, training_set_dict[training_set_key[0]].resolution)        
     # Hi Junho Park ????
@@ -202,8 +202,10 @@ def training_loop(
             save_image_grid(images, os.path.join(run_dir, f'reals_{tsk}.png'), drange=[0,255], grid_size=grid_size)
             grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_size_per_key[tsk] // num_gpus)
             grid_c = torch.from_numpy(labels).to(device).split(batch_size_per_key[tsk] // num_gpus)
+
             # images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            # save_image_grid(images, os.path.join(run_dir, f'fakes_init_{tsk}.png'), drange=[-1,1], grid_size=grid_size)
+            images = G_ema(z=z_test, c=c_test, noise_mode='const', img_resolution=training_set_dict[tsk].resolution).cpu()
+            save_image_grid(images, os.path.join(run_dir, f'fakes_init_{tsk}.png'), drange=[-1,1], grid_size=(min_batch, 1))
 
             grid_size_dict[tsk] = grid_size
             grid_z_dict[tsk] = grid_z
@@ -362,6 +364,7 @@ def training_loop(
             adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
             augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
         
+        print(cur_nimg)
         if cur_tick % progress_term == progress_term - 1:
             kid += 1
             kid = min(kid, len(training_set_key) - 1)
@@ -401,8 +404,10 @@ def training_loop(
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             for tsk in training_set_key:
                 # if training_set_dict[tsk].resolution <= training_set.resolution:
-                images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
-                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
+                # images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
+                # save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
+                images = G_ema(z=z_test, c=c_test, img_resolution=training_set_dict[tsk].resolution, noise_mode='const').cpu()
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=(min_batch, 1))
 
         # Save network snapshot.
         snapshot_pkl = None
