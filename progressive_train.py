@@ -133,7 +133,8 @@ def parse_comma_separated_list(s):
 # Required.
 @click.argument('data',         metavar='[ZIP|DIR]',                                            required=True, nargs=-1)
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-sn', 'stylegan3-v1', 'stylegan3-v2', 'stylegan3-v3', 'stylegan3-v4', 'stylegan3-v5']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-sn', 
+                                                                                                                   'stylegan3-v1', 'stylegan3-v2', 'stylegan3-v3', 'stylegan3-v4', 'stylegan3-v5', 'stylegan3-v5-cp']), required=True)
 @click.option('--loop-module',  help='Training loop module',                                    type=click.Choice(['training_loop', 'progressive_training_loop']), required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -286,6 +287,19 @@ def main(data, **kwargs):
     elif opts.cfg == 'stylegan3-v5':
         c.G_kwargs.class_name = 'training.networks_stylegan3_ver5.Generator'
         c.D_kwargs.class_name = 'training.networks_stylegan3_ver5.Discriminator'
+        c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))  
+        c.G_kwargs.conv_kernel = 3
+        c.D_kwargs.block_kwargs.conv_kernel = 3
+
+        c.G_kwargs.num_layers = 7
+        c.D_kwargs.num_layers = 4
+
+        c.G_kwargs.first_cutoff = 2 ** 1.9
+        c.G_kwargs.first_stopband = 2 ** 3
+        c.G_kwargs.output_scale = 0.5
+    elif opts.cfg == 'stylegan3-v5-cp':
+        c.G_kwargs.class_name = 'training.networks_stylegan3_ver5_rank.Generator'
+        c.D_kwargs.class_name = 'training.networks_stylegan3_ver5_rank.Discriminator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))  
         c.G_kwargs.conv_kernel = 3
         c.D_kwargs.block_kwargs.conv_kernel = 3

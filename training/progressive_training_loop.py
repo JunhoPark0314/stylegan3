@@ -364,7 +364,6 @@ def training_loop(
             adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
             augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
         
-        print(cur_nimg)
         if cur_tick % progress_term == progress_term - 1:
             kid += 1
             kid = min(kid, len(training_set_key) - 1)
@@ -407,7 +406,7 @@ def training_loop(
                 # images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
                 # save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
                 images = G_ema(z=z_test, c=c_test, img_resolution=training_set_dict[tsk].resolution, noise_mode='const').cpu()
-                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=(min_batch, 1))
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=(min_batch//2, 2))
 
         # Save network snapshot.
         snapshot_pkl = None
