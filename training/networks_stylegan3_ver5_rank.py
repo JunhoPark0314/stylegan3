@@ -255,28 +255,34 @@ class SynthesisKernel(torch.nn.Module):
 		up_factor		= 1,
 		filter_size 	= 4,
 		is_rgb			= False,
+		demod			= False,
+		w0_init			= 5,
 	):
 		super().__init__()
 		# self.w_dim = w_dim
 		self.out_dim = out_dim
 		self.in_dim = in_dim
-		self.hidden_dim = 64
+		self.hidden_dim = min(out_dim, in_dim)
 		self.filter_size = filter_size
 		self.hz_gen = SirenNet(
 			dim_in = 1,
 			dim_hidden = self.hidden_dim,
-			dim_out = self.out_dim * self.in_dim,
+			dim_out = self.in_dim,
 			num_layers = 3,
-			w0_initial = 1,
+			w0_initial = w0_init,
 		)
+		self.hz_scale = torch.nn.Parameter(torch.randn([self.in_dim, 1])/10)
+		self.hz_outdim = torch.nn.Parameter(torch.randn([self.out_dim, self.in_dim]))
 
 		self.vt_gen = SirenNet(
 			dim_in = 1,
 			dim_hidden = self.hidden_dim,
-			dim_out = self.out_dim * self.in_dim,
+			dim_out = self.out_dim,
 			num_layers = 3,
-			w0_initial = 1,
+			w0_initial = w0_init,
 		)
+		self.vt_scale = torch.nn.Parameter(torch.randn([self.in_dim, 1])/10)
+		self.vt_outdim = torch.nn.Parameter(torch.randn([self.out_dim, self.in_dim]))
 
 		self.init_size = init_size
 		self.out_size = init_size
@@ -286,6 +292,7 @@ class SynthesisKernel(torch.nn.Module):
 		self.max_sampling_rate = max_sampling_rate
 		self.is_rgb = is_rgb
 		self.density = 1
+		self.demod = demod
 		self.weight_gain = 1 / np.sqrt(self.in_dim * (self.out_size))
 		# self.test_weight = torch.nn.Parameter(torch.randn([self.out_dim, 1, self.out_size, self.out_size]) / np.sqrt(6))
 
@@ -294,6 +301,7 @@ class SynthesisKernel(torch.nn.Module):
 		knots = np.arange(gauss_size) - gauss_size // 2
 		gauss_filter = torch.from_numpy(gauss_spline(knots, 30))
 		gauss_filter /= gauss_filter.sum()
+		gauss_filter *= self.out_size
 		self.register_buffer('gauss_filter', gauss_filter.view(1,1,gauss_size).cuda())
 		# gauss_filter = (gauss_filter.view(1, -1) * gauss_filter.view(-1, 1)).sqrt()
 		# gauss_filter /= gauss_filter.std() * 2
@@ -311,20 +319,35 @@ class SynthesisKernel(torch.nn.Module):
 			gauss_size = self.out_size
 			knots = np.arange(gauss_size) - gauss_size // 2
 			gauss_filter = torch.from_numpy(gauss_spline(knots, gauss_size))
+			gauss_filter /= gauss_filter.sum()
+			gauss_filter *= self.out_size
 			self.register_buffer('gauss_filter', gauss_filter.view(1,1,gauss_size).cuda())
-			self.weight_gain = 1 / np.sqrt(self.in_dim * (self.out_size))
+			self.weight_gain = 1 / np.sqrt((self.out_size) * self.density * (self.out_dim))
 	
 	def forward(self, x):
 		device = x.device
 		x_grid = (torch.arange(self.out_size, device=device) - (self.out_size - 1) / 2) * (2 / (self.out_size))
 		y_grid = (torch.arange(self.out_size, device=device) - (self.out_size - 1) / 2) * (2 / (self.out_size))
 
-		hz_weight = self.hz_gen(x_grid.view(-1, 1)).permute(1,0).view(self.out_dim, self.in_dim, 1, self.out_size) #/ np.sqrt(self.out_size)
-		vt_weight = self.vt_gen(y_grid.view(-1, 1)).permute(1,0).view(self.out_dim, self.in_dim, self.out_size, 1) #/ np.sqrt(self.out_size)
-		hz_weight = hz_weight * hz_weight.square().mean([1,2,3], keepdim=True).rsqrt() * self.weight_gain
-		vt_weight = vt_weight * vt_weight.square().mean([1,2,3], keepdim=True).rsqrt() * self.weight_gain
-		# hz_weight *= self.gauss_filter.view(1, 1, 1, self.out_size).to(device) 
+		hz_weight = self.hz_gen(x_grid.view(-1, 1)).permute(1,0)
+		hz_weight = self.hz_scale.sigmoid() * hz_weight
+		hz_weight = torch.einsum('og,oi->oig',hz_weight,self.hz_outdim)
+		hz_weight = hz_weight.view(self.out_dim, self.in_dim, 1, self.out_size) #/ np.sqrt(self.out_size)
+
+		vt_weight = self.vt_gen(y_grid.view(-1, 1)).permute(1,0)
+		vt_weight = self.vt_scale.sigmoid() * vt_weight
+		vt_weight = torch.einsum('og,oi->oig',vt_weight,self.vt_outdim)
+		vt_weight = vt_weight.view(self.out_dim, self.in_dim, self.out_size, 1) #/ np.sqrt(self.out_size)
+
+		if self.demod:
+			hz_weight = hz_weight * (hz_weight.square().mean([1,2,3], keepdim=True) + 1e-8).rsqrt()
+			vt_weight = vt_weight * (vt_weight.square().mean([1,2,3], keepdim=True) + 1e-8).rsqrt()
+
+		# hz_weight *= self.gauss_filter.view(1, 1, 1, self.out_size).to(device)
 		# vt_weight *= self.gauss_filter.view(1, 1, self.out_size, 1).to(device)
+
+		hz_weight *= self.weight_gain
+		vt_weight *= self.weight_gain
 
 		# if self.out_size > 1:
 		# 	weight = weight - weight.mean([1,2,3], keepdim=True)
@@ -561,7 +584,8 @@ class SynthesisLayer(torch.nn.Module):
 			in_sampling_rate=in_sampling_rate,
 			max_sampling_rate=max_sampling_rate,
 			init_size=conv_kernel,
-			down_factor=2
+			down_factor=2,
+			demod=True,
 		)
 
 		self.init_size_hyper(in_size, out_size, in_sampling_rate, out_sampling_rate, in_cutoff, out_cutoff, in_half_width, out_half_width)
@@ -630,13 +654,6 @@ class SynthesisLayer(torch.nn.Module):
 		misc.assert_shape(x, [None, self.in_channels, int(self.in_size[1]), int(self.in_size[0])])
 		misc.assert_shape(w, [x.shape[0], self.w_dim])
 
-		# Track input magnitude.
-		if update_emas:
-			with torch.autograd.profiler.record_function('update_magnitude_ema'):
-				magnitude_cur = x.detach().to(torch.float32).square().mean()
-				self.magnitude_ema.copy_(magnitude_cur.lerp(self.magnitude_ema, self.magnitude_ema_beta))
-		input_gain = self.magnitude_ema.rsqrt()
-
 		# Execute affine layer.
 		styles = self.affine(w)
 		if self.is_torgb:
@@ -649,8 +666,19 @@ class SynthesisLayer(torch.nn.Module):
 		hz_weight, vt_weight = self.weight_gen(x)
 		lr_x = depthwise_demod_conv2d(x=x.to(dtype), w=self.lr_weight.to(dtype), groups=1) / np.sqrt(self.in_channels)
 		lr_x = torch.nn.functional.pad(lr_x, pad=[self.conv_kernel - 1]*4)
-		hz_x = depthwise_demod_conv2d(x=lr_x.to(dtype), w=hz_weight) / np.sqrt(self.conv_kernel/2)
-		vt_x = depthwise_demod_conv2d(x=hz_x.to(dtype), w=vt_weight) / np.sqrt(self.conv_kernel/2)
+		hz_x = depthwise_demod_conv2d(x=lr_x.to(dtype), w=hz_weight) 
+		vt_x = depthwise_demod_conv2d(x=hz_x.to(dtype), w=vt_weight) #* np.sqrt(max(self.weight_gen.density-1,1))
+
+		if self.conv_kernel > 3:
+			vt_x *= np.sqrt(3/2)
+
+		# Track input magnitude.
+		if update_emas:
+			with torch.autograd.profiler.record_function('update_magnitude_ema'):
+				magnitude_cur = vt_x.detach().to(torch.float32).square().mean()
+				self.magnitude_ema.copy_(magnitude_cur.lerp(self.magnitude_ema, self.magnitude_ema_beta))
+		input_gain = self.magnitude_ema.rsqrt()
+		vt_x *= input_gain
 
 		# x = torch.nn.PixelUnshuffle(self.weight_gen.density)(x)
 		# x = depthwise_demod_conv2d(x=x.to(dtype), w=weight, groups=x.shape[1], demodulate=True, input_gain=None)
@@ -658,7 +686,7 @@ class SynthesisLayer(torch.nn.Module):
 		
 		gain = 1 if self.is_torgb else np.sqrt(2)
 		x = modulated_conv2d(x=vt_x.to(dtype), w=self.style_weight, s=styles,
-			padding=0, demodulate=(not self.is_torgb), input_gain=input_gain)
+			padding=0, demodulate=(not self.is_torgb))
 
 		# Execute bias, filtered leaky ReLU, and clamping.
 		# gain = 1 if self.is_torgb else np.sqrt(2)
@@ -669,7 +697,8 @@ class SynthesisLayer(torch.nn.Module):
 		# Ensure correct shape and dtype.
 		misc.assert_shape(x, [None, self.out_channels, int(self.out_size[1]), int(self.out_size[0])])
 		assert x.dtype == dtype
-		return x if self.is_torgb else x.tanh()
+		return x
+		# return x if self.is_torgb else x.tanh()
 
 	@staticmethod
 	def design_lowpass_filter(numtaps, cutoff, width, fs, radial=False):
@@ -807,7 +836,7 @@ class SynthesisNetwork(torch.nn.Module):
 		# Compute remaining layer parameters.
 		sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, img_resolution)))) # s[i]
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
-		margin_size = np.clip((np.rint(np.log2(last_cutoff // self.first_cutoff))) * 5, a_min=0, a_max=self.margin_size*2)
+		margin_size = np.clip((np.rint(np.log2(last_cutoff // self.first_cutoff)) - 2) * 3, a_min=0, a_max=self.margin_size)
 		sizes = sampling_rates + margin_size * 2
 		# if hasattr(self, 'min_sampling_rates'):
 		# 	# For pixel shuffle
@@ -877,6 +906,9 @@ class Generator(torch.nn.Module):
 		ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
 		img = self.synthesis(ws, img_resolution, update_emas=update_emas, **synthesis_kwargs)
 		return img
+	
+	def init_size_hyper(self, resolution):
+		self.synthesis.init_size_hyper(resolution)
 	
 #----------------------------------------------------------------------------
 
@@ -987,8 +1019,10 @@ class DiscriminatorBlock(torch.nn.Module):
 			self.in_half_width = in_half_width
 			self.out_half_width = out_half_width
 
-			self.down_factor = 4 if (self.out_size[0] // self.in_size[0] > 1) else 1
-			self.up_factor = (self.down_factor + 1) // 2
+			# self.down_factor = 4 if (self.out_size[0] // self.in_size[0] > 1) else 1
+			# self.up_factor = (self.down_factor + 1) // 2
+			self.up_factor = self.tmp_sampling_rate // self.in_sampling_rate
+			self.down_factor = min(self.tmp_sampling_rate // self.out_sampling_rate, 3)
 
 			self.density = density
 			self.conv0_gen.init_size_hyper(in_sampling_rate=in_sampling_rate)
@@ -997,7 +1031,7 @@ class DiscriminatorBlock(torch.nn.Module):
 
 			pad_total = (self.out_size - 1) * self.down_factor + 1 # Desired output size before downsampling.
 			pad_total -= (self.in_size) * self.up_factor # Input size after upsampling.
-			pad_total += 2 * (self.up_factor - 1) # Size reduction caused by the filters.
+			pad_total += 4 * 1 - 2 # Size reduction caused by the filters.
 			pad_lo = (pad_total + self.up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
 			pad_hi = pad_total - pad_lo
 			self.padding = [int(pad_lo[0]), int(pad_hi[0]), int(pad_lo[1]), int(pad_hi[1])]
@@ -1027,17 +1061,21 @@ class DiscriminatorBlock(torch.nn.Module):
 			y = self.skip(x, gain=np.sqrt(0.5))
 			hz_w0, vt_w0 = self.conv0_gen(x)
 			
-			lr_x0 = self.conv_wrap(x, self.lr_weight0)
+			lr_x0 = self.conv_wrap(x, self.lr_weight0) / np.sqrt(self.in_channels)
 			lr_x0 = torch.nn.functional.pad(lr_x0, pad=[self.conv_kernel//2, (self.conv_kernel-1)//2, self.conv_kernel//2, (self.conv_kernel-1)//2])
 			hz_x0 = self.conv_wrap(lr_x0, hz_w0) #, groups=int(self.in_channels//2))
 			vt_x0 = self.conv_wrap(hz_x0, vt_w0) #, groups=int(self.in_channels//2))
+			if self.conv_kernel > 3:
+				vt_x0 *= np.sqrt(3/2)
 			x = self.conv0_point(vt_x0)
 
 			hz_w1, vt_w1 = self.conv1_gen(x)
-			lr_x1 = self.conv_wrap(x, self.lr_weight1)
+			lr_x1 = self.conv_wrap(x, self.lr_weight1) / np.sqrt(self.out_channels)
 			lr_x1 = torch.nn.functional.pad(lr_x1, pad=[self.conv_kernel//2, (self.conv_kernel-1)//2, self.conv_kernel//2, (self.conv_kernel-1)//2])
 			hz_x1 = self.conv_wrap(lr_x1, hz_w1) #, groups=int(self.out_channels//2))
 			vt_x1 = self.conv_wrap(hz_x1, vt_w1) #, groups=int(self.out_channels//2))
+			if self.conv_kernel > 3:
+				vt_x1 *= np.sqrt(3/2)
 			vt_x1 = y.add_(vt_x1)
 
 			self.conv1_point.padding = self.padding
@@ -1049,7 +1087,7 @@ class DiscriminatorBlock(torch.nn.Module):
 			x = self.conv1(x)
 
 		assert x.dtype == dtype
-		return x.tanh(), img
+		return x, img
 
 	def extra_repr(self):
 		return f'resolution={self.in_size[0]:d}, architecture={self.architecture:s}'
@@ -1235,8 +1273,9 @@ class Discriminator(torch.nn.Module):
 		# Compute remaining layer parameters
 		sampling_rates = np.exp2(np.ceil(np.log2(np.maximum(stopbands * 2, self.out_resolution))))
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs
-		margin_size = np.clip((np.rint(np.log2(first_cutoff // self.last_cutoff))) * 4, a_min=0, a_max=self.margin_size*2)
-		sizes = sampling_rates + margin_size * 2
+		margin_size = np.clip((np.rint(np.log2(first_cutoff // self.last_cutoff)) - 2) * 3, a_min=0, a_max=self.margin_size)
+		# sizes = sampling_rates + margin_size * 2
+		sizes = sampling_rates
 
 		# if hasattr(self, 'min_sampling_rates'):
 		# 	# For pixel shuffle

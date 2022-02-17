@@ -211,6 +211,8 @@ def training_loop(
             grid_z_dict[tsk] = grid_z
             grid_c_dict[tsk] = grid_c
 
+        G_ema.init_size_hyper(resolution=training_set_dict[training_set_key[0]].resolution)
+
     # Setup augmentation.
     if rank == 0:
         print('Setting up augmentation...')
@@ -338,21 +340,15 @@ def training_loop(
 
         # Update G_ema.
         with torch.autograd.profiler.record_function('Gema'):
+            G_ema.init_size_hyper(resolution=training_set.resolution)
             ema_nimg = ema_kimg * 1000
             if ema_rampup is not None:
                 ema_nimg = min(ema_nimg, cur_nimg * ema_rampup)
             ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
             for p_ema, p in zip(G_ema.parameters(), G.parameters()):
                 p_ema.copy_(p.lerp(p_ema, ema_beta))
-            G_ema_buffer_dict = dict(G_ema.named_buffers())
-            G_buffer_dict = dict(G.named_buffers())
-            for k in G_ema_buffer_dict.keys():
-                if G_ema_buffer_dict[k].shape == G_buffer_dict[k].shape:
-                    G_ema_buffer_dict[k].copy_(G_buffer_dict[k])
-                else:
-                    G_ema_buffer_dict[k] = G_buffer_dict[k]
-            # for b_ema, b in zip(G_ema.buffers(), G.buffers()):
-            #     b_ema.copy_(b)
+            for b_ema, b in zip(G_ema.buffers(), G.buffers()):
+                b_ema.copy_(b)
 
         # Update state.
         cur_nimg += batch_size
@@ -399,15 +395,6 @@ def training_loop(
                 print()
                 print('Aborting...')
 
-        # Save image snapshot.
-        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
-            for tsk in training_set_key:
-                # if training_set_dict[tsk].resolution <= training_set.resolution:
-                # images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
-                # save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
-                images = G_ema(z=z_test, c=c_test, img_resolution=training_set_dict[tsk].resolution, noise_mode='const').cpu()
-                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=(min_batch//2, 2))
-
         # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
@@ -426,6 +413,15 @@ def training_loop(
             if rank == 0:
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
+
+        # Save image snapshot.
+        if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
+            for tsk in training_set_key:
+                # if training_set_dict[tsk].resolution <= training_set.resolution:
+                # images = torch.cat([G_ema(z=z, c=c, img_resolution=training_set_dict[tsk].resolution, noise_mode='const', ).cpu() for z, c in zip(grid_z_dict[tsk], grid_c_dict[tsk])]).numpy()
+                # save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=grid_size_dict[tsk])
+                images = G(z=z_test, c=c_test, img_resolution=training_set_dict[tsk].resolution, noise_mode='const').cpu()
+                save_image_grid(images, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}_{tsk}.png'), drange=[-1,1], grid_size=(min_batch//2, 2))
 
         # Evaluate metrics.
         if (snapshot_data is not None) and (len(metrics) > 0):

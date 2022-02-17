@@ -296,7 +296,7 @@ def main(data, **kwargs):
 
         c.G_kwargs.first_cutoff = 2 ** 1.9
         c.G_kwargs.first_stopband = 2 ** 3
-        c.G_kwargs.output_scale = 0.5
+        c.G_kwargs.output_scale = 0.25
     elif opts.cfg == 'stylegan3-v5-cp':
         c.G_kwargs.class_name = 'training.networks_stylegan3_ver5_rank.Generator'
         c.D_kwargs.class_name = 'training.networks_stylegan3_ver5_rank.Discriminator'
@@ -309,7 +309,7 @@ def main(data, **kwargs):
 
         c.G_kwargs.first_cutoff = 2 ** 1.9
         c.G_kwargs.first_stopband = 2 ** 3
-        c.G_kwargs.output_scale = 0.5
+        c.G_kwargs.output_scale = 2
     else:
         c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
