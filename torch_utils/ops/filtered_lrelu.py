@@ -154,6 +154,36 @@ def _filtered_lrelu_ref(x, fu=None, fd=None, b=None, up=1, down=1, padding=0, ga
 
 #----------------------------------------------------------------------------
 
+@misc.profiled_function
+def filtered_sin_ref(x, fu=None, fd=None, up=1, down=1, padding=0, flip_filter=False):
+    """Slow and memory-inefficient reference implementation of `filtered_lrelu()` using
+    existing `upfirdn2n()` and `bias_act()` ops.
+    """
+    assert isinstance(x, torch.Tensor) and x.ndim == 4
+    fu_w, fu_h = _get_filter_size(fu)
+    fd_w, fd_h = _get_filter_size(fd)
+    assert isinstance(up, int) and up >= 1
+    assert isinstance(down, int) and down >= 1
+    px0, px1, py0, py1 = _parse_padding(padding)
+
+    # Calculate output size.
+    batch_size, channels, in_h, in_w = x.shape
+    in_dtype = x.dtype
+    out_w = (in_w * up + (px0 + px1) - (fu_w - 1) - (fd_w - 1) + (down - 1)) // down
+    out_h = (in_h * up + (py0 + py1) - (fu_h - 1) - (fd_h - 1) + (down - 1)) // down
+
+    # Compute using existing ops.
+    x = upfirdn2d.upfirdn2d(x=x, f=fu, up=up, padding=[px0, px1, py0, py1], gain=up**2, flip_filter=flip_filter).sin() # Upsample.
+    x *= np.exp(1/2)
+    x = upfirdn2d.upfirdn2d(x=x, f=fd, down=down, flip_filter=flip_filter) # Downsample.
+
+    # Check output shape & dtype.
+    misc.assert_shape(x, [batch_size, channels, out_h, out_w])
+    assert x.dtype == in_dtype
+    return x
+
+#----------------------------------------------------------------------------
+
 _filtered_lrelu_cuda_cache = dict()
 
 def _filtered_lrelu_cuda(up=1, down=1, padding=0, gain=np.sqrt(2), slope=0.2, clamp=None, flip_filter=False):

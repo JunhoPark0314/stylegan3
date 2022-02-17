@@ -81,6 +81,11 @@ class Siren(nn.Module):
         self.activation = Sine(w0) if activation is None else activation
 
     def init_(self, weight, bias, c, w0):
+        weight.normal_(std=math.sqrt(c/self.dim_in))
+        if exists(bias):
+            bias.normal_(std=math.sqrt(c/self.dim_in))
+        return 
+
         dim = self.dim_in
 
         w_std = (1 / dim) if self.is_first else (math.sqrt(c / dim) / w0)
@@ -113,7 +118,8 @@ class SirenNet(nn.Module):
                 dim_out = dim_hidden,
                 w0 = layer_w0,
                 use_bias = use_bias,
-                is_first = is_first
+                is_first = is_first,
+                activation = Sine(layer_w0) if is_first else final_activation
             ))
 
         final_activation = nn.Identity() if not exists(final_activation) else final_activation
@@ -130,6 +136,10 @@ class SirenNet(nn.Module):
                 # x *= rearrange(mod, 'd -> () d')
 
         return self.last_layer(x)
+    
+    def freeze(self):
+        for key, params in self.named_parameters():
+            params.requires_grad_(False)
 
 # siren network
 
