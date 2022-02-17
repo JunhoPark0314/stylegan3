@@ -247,6 +247,138 @@ class Conv2dWrapper(torch.nn.Module):
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
+class DepthwiseSynthesisKernel(torch.nn.Module):
+	def __init__(self,
+		in_dim,
+		out_dim,        # Number of output channels.
+		in_sampling_rate, 
+		max_sampling_rate,
+		init_size,
+		down_factor,
+		up_factor		= 1,
+		filter_size 	= 4,
+		is_rgb			= False,
+		demod			= True,
+		w0_init			= 24,
+	):
+		super().__init__()
+		# self.w_dim = w_dim
+		self.out_dim = out_dim
+		self.in_dim = in_dim
+		self.hidden_dim = min(out_dim, in_dim)
+		self.filter_size = filter_size
+
+		freqs = torch.randn([self.hidden_dim, 2])
+		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
+		freqs /= radii * radii.square().exp().pow(0.25)
+		freqs *= 8
+		phases = torch.rand([self.hidden_dim]) - 0.5
+
+		self.register_buffer('freqs', freqs)
+		self.register_buffer('phases', phases)
+		self.register_buffer('spectral_reg', (-self.freqs.abs()*4).exp())
+
+		self.hz_outdim = torch.nn.Parameter(torch.randn([self.in_dim, self.hidden_dim]))
+		self.vt_outdim = torch.nn.Parameter(torch.randn([self.in_dim, self.hidden_dim]))
+
+		# self.spectral_norm = [self.hidden_dim] * 2
+		# self.hz_outdim = torch.nn.Parameter(torch.randn([self.out_dim, self.in_dim, self.hidden_dim]))
+		# self.vt_outdim = torch.nn.Parameter(torch.randn([self.out_dim, self.in_dim, self.hidden_dim]))
+
+		self.init_size = init_size
+		self.out_size = init_size
+		self.in_size = init_size 
+		self.sigma = 1 / init_size
+		self.in_sampling_rate = in_sampling_rate
+		self.max_sampling_rate = max_sampling_rate
+		self.is_rgb = is_rgb
+		self.density = 1
+		self.demod = demod
+		self.weight_gain = 1 / np.sqrt(self.in_dim * (self.out_size))
+		# self.test_weight = torch.nn.Parameter(torch.randn([self.out_dim, 1, self.out_size, self.out_size]) / np.sqrt(6))
+
+		# gauss_size = int(self.max_sampling_rate / self.in_sampling_rate) * self.init_size
+		gauss_size = self.out_size
+		knots = np.arange(gauss_size) - gauss_size // 2
+		gauss_filter = torch.from_numpy(gauss_spline(knots, 30))
+		gauss_filter /= gauss_filter.sum()
+		gauss_filter *= self.out_size
+		self.register_buffer('gauss_filter', gauss_filter.view(1,1,gauss_size).cuda())
+		# gauss_filter = (gauss_filter.view(1, -1) * gauss_filter.view(-1, 1)).sqrt()
+		# gauss_filter /= gauss_filter.std() * 2
+
+		# if hasattr(self, 'gauss_filter'):
+		# 	self.register_buffer('gauss_filter', gauss_filter.to(self.gauss_filter.device))
+		# else:
+
+	
+	def init_size_hyper(self, in_sampling_rate):
+		if self.init_size != 1:
+			self.density = int(in_sampling_rate // self.in_sampling_rate)
+			self.out_size = self.density * self.init_size
+			self.in_size = self.density * self.init_size
+			self.sigma = 1 / self.density
+			gauss_size = self.out_size
+			knots = np.arange(gauss_size) - gauss_size // 2
+			gauss_filter = torch.from_numpy(gauss_spline(knots, gauss_size))
+			gauss_filter /= gauss_filter.sum()
+			gauss_filter *= self.out_size
+			self.register_buffer('gauss_filter', gauss_filter.view(1,1,gauss_size).cuda())
+			self.weight_gain = np.sqrt(1 / ((self.out_size) * self.density))
+		
+	def sample_grid(self, out_size, device):
+		x_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
+		y_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
+		x_grid = self.freqs[:,0].unsqueeze(-1) * x_grid.unsqueeze(0) + self.phases.unsqueeze(-1)
+		y_grid = self.freqs[:,1].unsqueeze(-1) * y_grid.unsqueeze(0) + self.phases.unsqueeze(-1)
+		return x_grid, y_grid
+	
+	def sample_weight(self, grid, coeff, reg):
+		out_size = grid.shape[1]//2
+		coeff = coeff * reg.view(1, -1)
+		norm = reg.sum()
+		weight = torch.nn.functional.interpolate(torch.sin(grid * np.pi * 2).unsqueeze(0), size=out_size, mode='linear', align_corners=False)[0]
+		weight = torch.einsum('cg,ic->ig',weight, coeff) / norm.sqrt()
+		return weight
+
+	
+	def forward(self, x, update_emas=True):
+		
+		if update_emas:
+			self.spectral_reg.copy_(self.spectral_reg.lerp_(torch.ones_like(self.spectral_reg).to(x.device), 0.99))
+
+		device = x.device
+		x_grid, y_grid = self.sample_grid(self.out_size, device)
+
+		hz_weight = self.sample_weight(x_grid, self.hz_outdim, self.spectral_reg[:,0])
+		hz_weight = hz_weight.view(self.in_dim, 1, 1, self.out_size) 
+		vt_weight = self.sample_weight(y_grid, self.vt_outdim, self.spectral_reg[:,1])
+		vt_weight = vt_weight.view(self.in_dim, 1, self.out_size, 1) 
+
+		if self.demod:
+			hz_weight = (hz_weight - hz_weight.mean()) 
+			hz_weight = hz_weight * (hz_weight.square().mean([0,1,2], keepdim=True) + 1e-8).rsqrt()
+			vt_weight = (vt_weight - vt_weight.mean())
+			vt_weight = vt_weight * (vt_weight.square().mean([0,1,2], keepdim=True) + 1e-8).rsqrt()
+
+		# hz_weight *= self.gauss_filter.view(1, 1, 1, self.out_size).to(device)
+		# vt_weight *= self.gauss_filter.view(1, 1, self.out_size, 1).to(device)
+
+		hz_weight *= self.weight_gain
+		vt_weight *= self.weight_gain
+
+		# if self.out_size > 1:
+		# 	weight = weight - weight.mean([1,2,3], keepdim=True)
+		# 	weight = weight * weight.square().mean([1,2,3], keepdim=True).rsqrt()
+
+		# print("{:10s}: {:5f}, {:5f}".format('synthkernel', *torch.std_mean(weight))) if DEBUG else 1
+		return hz_weight.type_as(x), vt_weight.type_as(x)
+
+
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
 class NaiveSynthesisKernel(torch.nn.Module):
 	def __init__(self,
 		in_dim,
@@ -724,7 +856,7 @@ class SynthesisLayer(torch.nn.Module):
 		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
 		self.register_buffer('magnitude_ema', torch.ones([]))
 	
-		self.weight_gen = NaiveSynthesisKernel(
+		self.weight_gen = DepthwiseSynthesisKernel(
 			in_dim=self.in_channels//2,
 			out_dim=self.in_channels//2,
 			in_sampling_rate=in_sampling_rate,
@@ -819,13 +951,20 @@ class SynthesisLayer(torch.nn.Module):
 		# Execute bias, filtered leaky ReLU, and clamping.
 
 		hz_weight, vt_weight = self.weight_gen(x, update_emas)
+
 		lr_x = depthwise_demod_conv2d(x=x.to(dtype), w=self.lr_weight.to(dtype), groups=1) / np.sqrt(self.in_channels)
+		lr_x = torch.nn.functional.pad(lr_x, [self.conv_kernel-1]*4)
+		hz_x = depthwise_demod_conv2d(x=lr_x.to(dtype), w=hz_weight, groups=self.in_channels//2) 
+		x = depthwise_demod_conv2d(x=hz_x.to(dtype), w=vt_weight, groups=self.in_channels//2) 
+
 		# if self.is_torgb is False:
 		# 	lr_x = filtered_lrelu.filtered_sin_ref(x=lr_x.to(torch.float32), fu=self.up_filter, fd=self.up_filter, padding=self.sin_padding,
 		# 		up=2, down=2)
-		lr_x = torch.nn.functional.pad(lr_x, [self.conv_kernel-1]*4)
-		hz_x = depthwise_demod_conv2d(x=lr_x.to(dtype), w=hz_weight) 
-		x = depthwise_demod_conv2d(x=hz_x.to(dtype), w=vt_weight) #/ np.sqrt(2) #* np.sqrt(max(self.weight_gen.density-1,1))
+
+		# lr_x = depthwise_demod_conv2d(x=x.to(dtype), w=self.lr_weight.to(dtype), groups=1) / np.sqrt(self.in_channels)
+		# lr_x = torch.nn.functional.pad(lr_x, [self.conv_kernel-1]*4)
+		# hz_x = depthwise_demod_conv2d(x=lr_x.to(dtype), w=hz_weight) 
+		# x = depthwise_demod_conv2d(x=hz_x.to(dtype), w=vt_weight) #/ np.sqrt(2) #* np.sqrt(max(self.weight_gen.density-1,1))
 
 		if update_emas:
 			with torch.autograd.profiler.record_function('update_magnitude_ema'):
