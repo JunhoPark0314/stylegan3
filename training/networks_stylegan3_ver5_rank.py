@@ -26,7 +26,7 @@ from torch_utils.ops.siren_pytorch import SirenNetIPE, SirenNet
 from torchvision.utils import save_image
 
 DEBUG=False
-DEBUG=True
+# DEBUG=True
 
 #----------------------------------------------------------------------------
 def depthwise_demod_conv2d(
@@ -324,7 +324,7 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 			gauss_filter /= gauss_filter.sum()
 			gauss_filter *= self.out_size
 			self.register_buffer('gauss_filter', gauss_filter.view(1,1,gauss_size).cuda())
-			self.weight_gain = np.sqrt(1 / ((self.out_size))) * np.power(self.density, 1/4)
+			self.weight_gain = np.sqrt(1 / ((self.out_size)))
 		
 	def sample_grid(self, out_size, device):
 		# x_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
@@ -1152,7 +1152,7 @@ class SynthesisNetwork(torch.nn.Module):
 		x = self.input(ws[0])
 		for name, w in zip(self.layer_names, ws[1:]):
 			x = getattr(self, name)(x, w, **layer_kwargs)
-			save_image(x[0,:3], f'{name}.png')
+			save_image(x[0,:3] * 10, f'{name}.png')
 			print("{:10s}: {:5f}, {:5f}".format(name, *torch.std_mean(x))) if DEBUG else 1
 		if self.output_scale != 1:
 			x = x * self.output_scale
@@ -1247,7 +1247,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		
 		self.conv_wrap = Conv2dWrapper(conv_clamp=conv_clamp)
 	
-		self.conv0_gen = NaiveSynthesisKernel(
+		self.conv0_gen = DepthwiseSynthesisKernel(
 			in_dim=self.in_channels//2,
 			out_dim=self.in_channels//2,
 			in_sampling_rate=in_sampling_rate,
@@ -1260,7 +1260,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.conv0_point = Conv2dLayer(in_channels//2, out_channels, kernel_size=1, bias=True,
 			conv_clamp=conv_clamp, channels_last=self.channels_last, activation='lrelu')
 		
-		self.conv1_gen = NaiveSynthesisKernel(
+		self.conv1_gen = DepthwiseSynthesisKernel(
 			in_dim=self.out_channels//2,
 			out_dim=self.out_channels//2,
 			in_sampling_rate=in_sampling_rate,
@@ -1354,20 +1354,16 @@ class DiscriminatorBlock(torch.nn.Module):
 			
 			lr_x0 = self.conv_wrap(x, self.lr_weight0) / np.sqrt(self.in_channels)
 			lr_x0 = torch.nn.functional.pad(lr_x0, pad=[self.conv_kernel//2, (self.conv_kernel-1)//2, self.conv_kernel//2, (self.conv_kernel-1)//2])
-			hz_x0 = self.conv_wrap(lr_x0, hz_w0) #, groups=int(self.in_channels//2))
-			vt_x0 = self.conv_wrap(hz_x0, vt_w0) #, groups=int(self.in_channels//2))
-			if self.conv_kernel > 3:
-				vt_x0 *= np.sqrt(3/2)
+			hz_x0 = self.conv_wrap(lr_x0, hz_w0, groups=int(self.in_channels//2))
+			vt_x0 = self.conv_wrap(hz_x0, vt_w0, groups=int(self.in_channels//2))
 			x = self.conv0_point(vt_x0)
 
 
 			hz_w1, vt_w1 = self.conv1_gen(x)
 			lr_x1 = self.conv_wrap(x, self.lr_weight1) / np.sqrt(self.out_channels)
 			lr_x1 = torch.nn.functional.pad(lr_x1, pad=[self.conv_kernel//2, (self.conv_kernel-1)//2, self.conv_kernel//2, (self.conv_kernel-1)//2])
-			hz_x1 = self.conv_wrap(lr_x1, hz_w1) #, groups=int(self.out_channels//2))
-			vt_x1 = self.conv_wrap(hz_x1, vt_w1) #, groups=int(self.out_channels//2))
-			if self.conv_kernel > 3:
-				vt_x1 *= np.sqrt(3/2)
+			hz_x1 = self.conv_wrap(lr_x1, hz_w1, groups=int(self.out_channels//2))
+			vt_x1 = self.conv_wrap(hz_x1, vt_w1, groups=int(self.out_channels//2))
 			vt_x1 = y.add_(vt_x1)
 
 			self.conv1_point.padding = self.padding
