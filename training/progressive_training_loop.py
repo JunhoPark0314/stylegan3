@@ -25,6 +25,7 @@ from torch_utils.ops import grid_sample_gradfix
 
 import legacy
 from metrics import metric_main
+SAVE = False
 
 #----------------------------------------------------------------------------
 
@@ -359,11 +360,10 @@ def training_loop(
             ada_stats.update()
             adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
             augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
-        
-        if cur_tick % progress_term == progress_term - 1:
-            kid += 1
-            kid = min(kid, len(training_set_key) - 1)
 
+        kid += 1
+        kid = min(kid, len(training_set_key) - 1)
+        
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
@@ -410,7 +410,7 @@ def training_loop(
                     snapshot_data[key] = value.cpu()
                 del value # conserve memory
             snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
-            if rank == 0:
+            if rank == 0 and SAVE:
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
 
@@ -467,6 +467,7 @@ def training_loop(
         tick_start_nimg = cur_nimg
         tick_start_time = time.time()
         maintenance_time = tick_start_time - tick_end_time
+
         if done:
             break
 

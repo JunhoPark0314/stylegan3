@@ -26,7 +26,7 @@ from torch_utils.ops.siren_pytorch import SirenNetIPE, SirenNet
 from torchvision.utils import save_image
 
 DEBUG=False
-# DEBUG=True
+DEBUG=True
 
 #----------------------------------------------------------------------------
 def depthwise_demod_conv2d(
@@ -271,12 +271,12 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 		freqs = torch.randn([self.hidden_dim, 2])
 		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
 		freqs /= radii * radii.square().exp().pow(0.25)
-		freqs *= 8
+		freqs *= w0_init
 		phases = torch.rand([self.hidden_dim]) - 0.5
 
 		self.register_buffer('freqs', freqs)
 		self.register_buffer('phases', phases)
-		self.register_buffer('spectral_reg', (-self.freqs.abs()*4).exp())
+		self.register_buffer('spectral_reg', ((-self.freqs.abs()*4).clip(min=-4)).exp())
 
 		self.hz_outdim = torch.nn.Parameter(torch.randn([self.in_dim, self.hidden_dim]))
 		self.vt_outdim = torch.nn.Parameter(torch.randn([self.in_dim, self.hidden_dim]))
@@ -324,21 +324,24 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 			gauss_filter /= gauss_filter.sum()
 			gauss_filter *= self.out_size
 			self.register_buffer('gauss_filter', gauss_filter.view(1,1,gauss_size).cuda())
-			self.weight_gain = np.sqrt(1 / ((self.out_size) * self.density))
+			self.weight_gain = np.sqrt(1 / ((self.out_size))) * np.power(self.density, 1/4)
 		
 	def sample_grid(self, out_size, device):
-		x_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
-		y_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
+		# x_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
+		# y_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
+
+		x_grid = (torch.arange(out_size, device=device) - ((out_size-1)/2)) * (2 / (out_size+1))
+		y_grid = (torch.arange(out_size, device=device) - ((out_size-1)/2)) * (2 / (out_size+1))
 		x_grid = self.freqs[:,0].unsqueeze(-1) * x_grid.unsqueeze(0) + self.phases.unsqueeze(-1)
 		y_grid = self.freqs[:,1].unsqueeze(-1) * y_grid.unsqueeze(0) + self.phases.unsqueeze(-1)
 		return x_grid, y_grid
 	
 	def sample_weight(self, grid, coeff, reg):
 		out_size = grid.shape[1]//2
-		coeff = coeff * reg.view(1, -1)
-		norm = reg.sum()
-		weight = torch.nn.functional.interpolate(torch.sin(grid * np.pi * 2).unsqueeze(0), size=out_size, mode='linear', align_corners=False)[0]
-		weight = torch.einsum('cg,ic->ig',weight, coeff) / norm.sqrt()
+		# coeff = coeff * reg.view(1, -1)
+		# norm = reg.sum()
+		weight = torch.einsum('cg,ic->ig',torch.sin(grid * np.pi * 2) * np.exp(-1/(2*self.density**2)), coeff) / np.sqrt(self.hidden_dim)
+		# weight = torch.nn.functional.interpolate(weight.unsqueeze(0), size=out_size, mode='linear', align_corners=False)[0]
 		return weight
 
 	
@@ -403,7 +406,7 @@ class NaiveSynthesisKernel(torch.nn.Module):
 		freqs = torch.randn([self.hidden_dim, 2])
 		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
 		freqs /= radii * radii.square().exp().pow(0.25)
-		freqs *= 8
+		freqs *= 24
 		phases = torch.rand([self.hidden_dim]) - 0.5
 
 		self.register_buffer('freqs', freqs)
@@ -850,9 +853,9 @@ class SynthesisLayer(torch.nn.Module):
 		self.lrelu_upsampling = lrelu_upsampling
 
 		# Setup parameters and buffers.
-		self.affine = FullyConnectedLayer(self.w_dim, self.in_channels//2, bias_init=1)
+		self.affine = FullyConnectedLayer(self.w_dim, self.in_channels if is_torgb else self.in_channels//2, bias_init=1)
 		self.lr_weight = torch.nn.Parameter(torch.randn([self.in_channels//2, self.in_channels, 1, 1]))
-		self.style_weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels//2, 1, 1]))
+		self.style_weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels if is_torgb else self.in_channels//2, 1, 1]))
 		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
 		self.register_buffer('magnitude_ema', torch.ones([]))
 	
@@ -917,7 +920,7 @@ class SynthesisLayer(torch.nn.Module):
 
 			# TODO: Change here to weight_gen layer
 			self.weight_gen.init_size_hyper(in_sampling_rate=self.in_sampling_rate)
-			self.conv_kernel = self.weight_gen.out_size
+			self.conv_kernel = 1 if self.is_torgb else self.weight_gen.out_size
 
 			# Compute padding.
 			pad_total = (self.out_size - 1) * self.down_factor + 1 # Desired output size before downsampling.
@@ -950,12 +953,12 @@ class SynthesisLayer(torch.nn.Module):
 		dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 		# Execute bias, filtered leaky ReLU, and clamping.
 
-		hz_weight, vt_weight = self.weight_gen(x, update_emas)
-
-		lr_x = depthwise_demod_conv2d(x=x.to(dtype), w=self.lr_weight.to(dtype), groups=1) / np.sqrt(self.in_channels)
-		lr_x = torch.nn.functional.pad(lr_x, [self.conv_kernel-1]*4)
-		hz_x = depthwise_demod_conv2d(x=lr_x.to(dtype), w=hz_weight, groups=self.in_channels//2) 
-		x = depthwise_demod_conv2d(x=hz_x.to(dtype), w=vt_weight, groups=self.in_channels//2) 
+		if self.is_torgb is False:
+			hz_weight, vt_weight = self.weight_gen(x, update_emas)
+			lr_x = depthwise_demod_conv2d(x=x.to(dtype), w=self.lr_weight.to(dtype), groups=1) / np.sqrt(self.in_channels)
+			lr_x = torch.nn.functional.pad(lr_x, [self.conv_kernel-1]*4)
+			hz_x = depthwise_demod_conv2d(x=lr_x.to(dtype), w=hz_weight, groups=self.in_channels//2) 
+			x = depthwise_demod_conv2d(x=hz_x.to(dtype), w=vt_weight, groups=self.in_channels//2) 
 
 		# if self.is_torgb is False:
 		# 	lr_x = filtered_lrelu.filtered_sin_ref(x=lr_x.to(torch.float32), fu=self.up_filter, fd=self.up_filter, padding=self.sin_padding,
