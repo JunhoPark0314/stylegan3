@@ -26,7 +26,7 @@ from torch_utils.ops.siren_pytorch import SirenNetIPE, SirenNet
 from torchvision.utils import save_image
 
 DEBUG=False
-DEBUG=True
+# DEBUG=True
 
 #----------------------------------------------------------------------------
 def depthwise_demod_conv2d(
@@ -273,11 +273,12 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 		freqs = torch.randn([self.hidden_dim, 2])
 		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
 		freqs /= radii * radii.square().exp().pow(0.25)
-		freqs *= w0_init * (max_sampling_rate // in_sampling_rate)
+		freqs *= w0_init #* (max_sampling_rate // in_sampling_rate)
 		phases = torch.rand([self.hidden_dim]) - 0.5
+		self.phases = torch.nn.Parameter(phases)
 
 		self.register_buffer('freqs', freqs)
-		self.register_buffer('phases', phases)
+		# self.register_buffer('phases', phases)
 		self.register_buffer('hz_mean', torch.zeros([]))
 		self.register_buffer('hz_std', torch.ones([self.out_dim,1,1,1]))
 		self.register_buffer('vt_mean', torch.zeros([]))
@@ -292,7 +293,7 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 
 		self.init_size = init_size
 		self.out_size = init_size
-		self.in_size = ((init_size+1)//2) * 4
+		self.in_size = ((init_size+1)//2) * 4 * (max_sampling_rate // in_sampling_rate)
 		self.sigma = 1 / init_size
 		self.in_sampling_rate = in_sampling_rate
 		self.max_sampling_rate = max_sampling_rate
@@ -301,16 +302,25 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 		self.demod = demod
 		self.weight_gain = 1 / np.sqrt(self.in_dim * (self.out_size))
 		self.ema_beta = 0.999
+		self.cutoff = cutoff
+		self.halfwidth = halfwidth*2
+		num_taps = self.in_size - self.out_size * 2 + 2
 
-		low_filter = design_lowpass_filter(numtaps=4, cutoff=cutoff, width=halfwidth*2, fs=in_sampling_rate * 2**0.1)
+		low_filter = design_lowpass_filter(numtaps=num_taps, cutoff=cutoff, width=halfwidth*2, fs=cutoff * 2**1.1)
+		gauss_filter = gauss_spline(np.arange(self.in_size) - (self.in_size-1) / 2, init_size)
 		self.register_buffer("low_filter", low_filter)
+		self.register_buffer("gauss_filter", torch.from_numpy(gauss_filter).unsqueeze(0).to(dtype=self.low_filter.dtype))
+		self.register_buffer("gauss_sigma", torch.ones([]))
 
 	def init_size_hyper(self, in_sampling_rate, cutoff, halfwidth):
 		self.density = int(in_sampling_rate // self.in_sampling_rate)
-		self.in_size = ((self.init_size+1)//2) * 4 * self.density
+		# self.in_size = ((self.init_size+1)//2) * 4 * self.density
 		self.out_size = (self.density * self.init_size) + (self.density * self.init_size - 1) % 2
-		low_filter = design_lowpass_filter(numtaps=4, cutoff=cutoff, width=halfwidth*2, fs=in_sampling_rate * 2**0.1)
-		self.low_filter.copy_(low_filter)
+		num_taps = self.in_size - self.out_size * 2 + 2
+		low_filter = design_lowpass_filter(numtaps=num_taps, cutoff=self.cutoff, width=self.halfwidth*2, fs=self.cutoff * 2**1.1)
+		# low_filter = design_lowpass_filter(numtaps=num_taps, cutoff=cutoff, width=halfwidth*2, fs=cutoff * 2**1.1)
+		self.register_buffer('low_filter', low_filter.to(self.low_filter.device))
+		# self.low_filter.copy_(low_filter)
 		
 	def sample_grid(self, out_size, device):
 		# x_grid = (torch.arange(out_size*2+1, device=device) - (out_size)) * (2 / (out_size*2+1))
@@ -324,6 +334,9 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 	
 	def sample_weight(self, grid, coeff):
 		weight = torch.einsum('cg,ic->ig',torch.sin(grid * np.pi * 2) * np.exp(-1/(2*self.density**2)), coeff) / np.sqrt(self.hidden_dim)
+		weight = weight - weight.mean()
+		weight = weight * (weight.square().mean(dim=[0], keepdims=True) + 1e-8).rsqrt()
+		weight = weight * self.gauss_filter / self.gauss_filter.max()
 		weight = torch.nn.functional.conv1d(weight.unsqueeze(1), self.low_filter.view(1,1,-1)).squeeze(1)
 		# weight = torch.nn.functional.interpolate(weight.unsqueeze(0), size=self.out_size, mode='linear')[0]
 		return weight[:,::2]
@@ -338,18 +351,23 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 		vt_weight = self.sample_weight(y_grid, self.vt_outdim)
 		vt_weight = vt_weight.view(self.in_dim, 1, self.out_size, 1) 
 
-		# if self.demod:
-		if update_emas:
-			self.hz_mean.copy_(self.hz_mean.lerp_(hz_weight.mean(), self.ema_beta))
-			self.vt_mean.copy_(self.vt_mean.lerp_(vt_weight.mean(), self.ema_beta))
+		# hz_weight = hz_weight - hz_weight.mean(dim=[0])
+		# hz_weight = hz_weight * (hz_weight.square().mean([0], keepdim=True) + 1e-8).rsqrt()
 
-			self.hz_std.copy_(self.hz_std.lerp_((hz_weight.square().mean([1,2,3], keepdim=True) + 1e-8).rsqrt(), self.ema_beta))
-			self.vt_std.copy_(self.vt_std.lerp_((vt_weight.square().mean([1,2,3], keepdim=True) + 1e-8).rsqrt(), self.ema_beta))
+		# vt_weight = vt_weight - vt_weight.mean(dim=[0])
+		# vt_weight = vt_weight * (vt_weight.square().mean([0], keepdim=True) + 1e-8).rsqrt()
 
-		hz_weight = (hz_weight - self.hz_mean) 
-		hz_weight = hz_weight * self.hz_std
-		vt_weight = (vt_weight - vt_weight.mean())
-		vt_weight = vt_weight * self.vt_std
+		# if update_emas:
+		# 	self.hz_mean.copy_(self.hz_mean.lerp_(hz_weight.mean(), self.ema_beta))
+		# 	self.vt_mean.copy_(self.vt_mean.lerp_(vt_weight.mean(), self.ema_beta))
+
+		# 	self.hz_std.copy_(self.hz_std.lerp_((hz_weight.square().mean([1,2,3], keepdim=True) + 1e-8).rsqrt(), self.ema_beta))
+		# 	self.vt_std.copy_(self.vt_std.lerp_((vt_weight.square().mean([1,2,3], keepdim=True) + 1e-8).rsqrt(), self.ema_beta))
+
+		# hz_weight = (hz_weight - self.hz_mean) 
+		# hz_weight = hz_weight * self.hz_std
+		# vt_weight = (vt_weight - vt_weight.mean())
+		# vt_weight = vt_weight * self.vt_std
 
 		# hz_weight *= self.weight_gain
 		# vt_weight *= self.weight_gain
@@ -699,6 +717,7 @@ class SynthesisInput(torch.nn.Module):
 		self.channels = channels
 		self.size = np.broadcast_to(np.asarray(size), [2])
 		self.sampling_rate = sampling_rate
+		self.init_sampling_rate = sampling_rate
 		self.bandwidth = bandwidth
 		self.density = 1
 
@@ -725,6 +744,7 @@ class SynthesisInput(torch.nn.Module):
 			self.size = np.broadcast_to(np.asarray(size), [2])
 			self.sampling_rate = sampling_rate
 			self.bandwidth = bandwidth
+			self.density = self.sampling_rate / self.init_sampling_rate 
 
 	def forward(self, w):
 
@@ -762,7 +782,7 @@ class SynthesisInput(torch.nn.Module):
 		# Compute Fourier features.
 		x = (grids.unsqueeze(3) @ freqs.permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]
 		x = x + phases.unsqueeze(1).unsqueeze(2)
-		x = torch.sin(x * (np.pi * 2))
+		x = torch.sin(x * (np.pi * 2)) * np.exp(1 - 1/(self.density))
 		x = x * amplitudes.unsqueeze(1).unsqueeze(2)
 
 		# Apply trainable mapping.
@@ -970,7 +990,7 @@ class SynthesisLayer(torch.nn.Module):
 		misc.assert_shape(x, [None, self.out_channels, int(self.out_size[1]), int(self.out_size[0])])
 		assert x.dtype == dtype
 		# return x 
-		return x 
+		return x * (-x**2).exp()
 
 	@staticmethod
 	def design_lowpass_filter(numtaps, cutoff, width, fs, radial=False):
@@ -1021,7 +1041,7 @@ class SynthesisNetwork(torch.nn.Module):
 		first_cutoff        = 2,        # Cutoff frequency of the first layer (f_{c,0}).
 		first_stopband      = 2**2.1,   # Minimum stopband of the first layer (f_{t,0}).
 		last_stopband_rel   = 2**0.2,   # Minimum stopband of the last layer, expressed relative to the cutoff.
-		margin_size			= 10,
+		margin_size			= 20,
 		output_scale        = 0.25,     # Scale factor for the output image.
 		num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
 		freq_channels       = 512,
@@ -1108,7 +1128,7 @@ class SynthesisNetwork(torch.nn.Module):
 		# Compute remaining layer parameters.
 		sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, img_resolution)))) # s[i]
 		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
-		margin_size = np.clip((np.rint(np.log2(last_cutoff // self.first_stopband))) * 2, a_min=0, a_max=self.margin_size)
+		margin_size = np.clip((np.rint(np.log2(last_cutoff // self.first_stopband))) * 4, a_min=0, a_max=self.margin_size)
 		sizes = sampling_rates + margin_size * 2
 		# if hasattr(self, 'min_sampling_rates'):
 		# 	# For pixel shuffle
@@ -1134,7 +1154,9 @@ class SynthesisNetwork(torch.nn.Module):
 		x = self.input(ws[0])
 		for name, w in zip(self.layer_names, ws[1:]):
 			x = getattr(self, name)(x, w, **layer_kwargs)
-			save_image(x[0,:3] * 10, f'{name}.png')
+			pad = (x.shape[-1] - getattr(self, name).out_sampling_rate)//2
+			sample_image = x[0,:3,pad:-pad,pad:-pad] if pad !=0 else x[0,:1]
+			save_image(sample_image * 10, f'V{name}_{img_resolution}.png')
 			print("{:10s}: {:5f}, {:5f}".format(name, *torch.std_mean(x))) if DEBUG else 1
 		if self.output_scale != 1:
 			x = x * self.output_scale

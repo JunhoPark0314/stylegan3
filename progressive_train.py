@@ -301,7 +301,7 @@ def main(data, **kwargs):
         c.G_kwargs.class_name = 'training.networks_stylegan3_ver5_rank.Generator'
         c.D_kwargs.class_name = 'training.networks_stylegan3_ver5_rank.Discriminator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))  
-        c.G_kwargs.conv_kernel = 3
+        c.G_kwargs.conv_kernel = 1
         c.D_kwargs.block_kwargs.conv_kernel = 3
 
         c.G_kwargs.num_layers = 7
