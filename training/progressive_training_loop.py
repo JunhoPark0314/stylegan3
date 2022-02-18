@@ -122,7 +122,7 @@ def training_loop(
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
     init_img_res            = 32,
-    max_img_res             = 512,
+    max_img_res             = 256,
     progress_term           = 300,
 ):
     # Initialize.
@@ -135,6 +135,23 @@ def training_loop(
     torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
+
+
+    def per_tick_fn(kid, max_kid, min_kid):
+        kid += 1
+        if kid == max_kid+1:
+            kid = min_kid
+        return kid
+
+    def set_min_max_kid(cur_tick, total_kimg, progress_term, min_kid, max_kid, train_set_len):
+        if cur_tick % progress_term == progress_term-1:
+            min_kid += 1
+            max_kid += 1
+            min_kid = min(min_kid, train_set_len - 1)
+            max_kid = min(max_kid, train_set_len - 1)
+        return min_kid, max_kid
+
+    progress_fn = set_min_max_kid
  
     # Load training set.
     if rank == 0:
@@ -146,6 +163,8 @@ def training_loop(
     batch_size_per_key = {}
     training_set_key = list(training_set_kwargs.keys()) # Assume we give them in increasing order
     kid = 0
+    min_kid = 0
+    max_kid = max(2, len(training_set_dict))
     curr_batch_size = batch_size
     for k in training_set_kwargs.keys():
         training_set_dict[k] = dnnlib.util.construct_class_by_name(**training_set_kwargs[k]) # subclass of training.dataset.Dataset
@@ -285,7 +304,7 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     batch_idx = 0
     if progress_fn is not None:
-        progress_fn(0, total_kimg)
+        min_kid, max_kid = progress_fn(0, total_kimg, progress_term, min_kid, max_kid, len(training_set_dict))
     while True:
 
         # Initialize training set with current target key 
@@ -361,12 +380,10 @@ def training_loop(
             adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
             augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
 
-        kid += 1
-        kid = min(kid, len(training_set_key) - 1)
-        
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
+            kid = per_tick_fn(kid, max_kid, min_kid)
             continue
 
         # Print status line, accumulating the same information in training_stats.
@@ -460,13 +477,16 @@ def training_loop(
                 stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
             stats_tfevents.flush()
         if progress_fn is not None:
-            progress_fn(cur_nimg // 1000, total_kimg)
+            min_kid, max_kid = progress_fn(cur_nimg // 1000, total_kimg, progress_term, min_kid, max_kid, len(training_set_dict))
 
         # Update state.
         cur_tick += 1
         tick_start_nimg = cur_nimg
         tick_start_time = time.time()
         maintenance_time = tick_start_time - tick_end_time
+
+
+            
 
         if done:
             break
