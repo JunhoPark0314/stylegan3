@@ -307,10 +307,10 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 		num_taps = self.in_size - self.out_size * 2 + 2
 
 		low_filter = design_lowpass_filter(numtaps=num_taps, cutoff=cutoff, width=halfwidth*2, fs=cutoff * 2**1.1)
-		gauss_filter = gauss_spline(np.arange(self.in_size) - (self.in_size-1) / 2, init_size)
+		gauss_filter = np.arange(self.in_size) - (self.in_size-1) / 2
 		self.register_buffer("low_filter", low_filter)
 		self.register_buffer("gauss_filter", torch.from_numpy(gauss_filter).unsqueeze(0).to(dtype=self.low_filter.dtype))
-		self.register_buffer("gauss_sigma", torch.ones([]))
+		self.gauss_sigma = torch.nn.Parameter(torch.ones([]))
 
 	def init_size_hyper(self, in_sampling_rate, cutoff, halfwidth):
 		self.density = int(in_sampling_rate // self.in_sampling_rate)
@@ -336,7 +336,10 @@ class DepthwiseSynthesisKernel(torch.nn.Module):
 		weight = torch.einsum('cg,ic->ig',torch.sin(grid * np.pi * 2) * np.exp(-1/(2*self.density**2)), coeff) / np.sqrt(self.hidden_dim)
 		weight = weight - weight.mean()
 		weight = weight * (weight.square().mean(dim=[0], keepdims=True) + 1e-8).rsqrt()
-		weight = weight * self.gauss_filter / self.gauss_filter.max()
+		gauss_sigma = 1 + self.gauss_sigma ** (2) / 5
+		gauss_filter = (-self.gauss_filter ** 2 / (2 * gauss_sigma)).exp()
+		weight = weight * gauss_filter 
+		# weight = weight * self.gauss_filter / self.gauss_filter.max()
 		weight = torch.nn.functional.conv1d(weight.unsqueeze(1), self.low_filter.view(1,1,-1)).squeeze(1)
 		# weight = torch.nn.functional.interpolate(weight.unsqueeze(0), size=self.out_size, mode='linear')[0]
 		return weight[:,::2]
@@ -990,7 +993,7 @@ class SynthesisLayer(torch.nn.Module):
 		misc.assert_shape(x, [None, self.out_channels, int(self.out_size[1]), int(self.out_size[0])])
 		assert x.dtype == dtype
 		# return x 
-		return x * (-x**2).exp()
+		return x if self.is_torgb else 1.5 * x * (-x**2/10).exp()
 
 	@staticmethod
 	def design_lowpass_filter(numtaps, cutoff, width, fs, radial=False):
@@ -1383,7 +1386,9 @@ class DiscriminatorBlock(torch.nn.Module):
 			x = self.conv1(x)
 
 		assert x.dtype == dtype
-		return x, img
+
+		return 1.5 * x * (-x**2/10).exp() , img
+		# return x, img
 
 	def extra_repr(self):
 		return f'resolution={self.in_size[0]:d}, architecture={self.architecture:s}'
