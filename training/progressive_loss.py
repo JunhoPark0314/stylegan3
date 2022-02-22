@@ -46,7 +46,7 @@ class StyleGAN2Loss(Loss):
                 cutoff = torch.empty([], dtype=torch.int64, device=ws.device).random_(1, ws.shape[1])
                 cutoff = torch.where(torch.rand([], device=ws.device) < self.style_mixing_prob, cutoff, torch.full_like(cutoff, ws.shape[1]))
                 ws[:, cutoff:] = self.G.mapping(torch.randn_like(z), c, update_emas=False)[:, cutoff:]
-        img = self.G.synthesis(ws, update_emas=update_emas)
+        img = self.G.synthesis(ws, resolution, update_emas=update_emas)
         return img, ws
 
     def run_D(self, img, c, resolution, blur_sigma=0, update_emas=False):
@@ -57,7 +57,7 @@ class StyleGAN2Loss(Loss):
                 img = upfirdn2d.filter2d(img, f / f.sum())
         if self.augment_pipe is not None:
             img = self.augment_pipe(img)
-        logits = self.D(img, c)
+        logits = self.D(img, c, resolution)
         return logits
 
     def accumulate_gradients(self, phase, real_img, real_c, gen_z, gen_c, gain, cur_nimg, resolution):

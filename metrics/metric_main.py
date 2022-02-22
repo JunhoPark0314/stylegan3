@@ -129,6 +129,12 @@ def eqr50k(opts):
     psnr = equivariance.compute_equivariance_metrics(opts, num_samples=50000, batch_size=4, compute_eqr=True)
     return dict(eqr50k=psnr)
 
+@register_metric
+def eqt5k_int(opts):
+    opts.G_kwargs.update(force_fp32=True)
+    psnr = equivariance.compute_equivariance_metrics(opts, num_samples=5000, batch_size=4, compute_eqt_int=True)
+    return dict(eqr5k=psnr)
+
 #----------------------------------------------------------------------------
 # Legacy metrics.
 

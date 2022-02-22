@@ -95,7 +95,7 @@ def launch_training(c, desc, outdir, dry_run, loop_module):
         if c.num_gpus == 1:
             subprocess_fn(rank=0, c=c, temp_dir=temp_dir, loop_module=loop_module)
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir), nprocs=c.num_gpus, loop_module=loop_module)
+            torch.multiprocessing.spawn(fn=subprocess_fn, args=(c, temp_dir, loop_module), nprocs=c.num_gpus)
 
 #----------------------------------------------------------------------------
 
@@ -125,7 +125,7 @@ def parse_comma_separated_list(s):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-sn', 'stylegan3-v1', 'stylegan3-v2', 'stylegan3-v3', 'stylegan3-v4', 'stylegan3-v5']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-sn', 'stylegan3-v1', 'stylegan3-v2', 'stylegan3-v3', 'stylegan3-v4', 'stylegan3-v5', 'stylegan3-v6']), required=True)
 @click.option('--loop-module',  help='Training loop module',                                    type=click.Choice(['training_loop', 'progressive_training_loop']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
@@ -269,6 +269,10 @@ def main(**kwargs):
         c.G_kwargs.num_layers = 7
         c.D_kwargs.num_layers = 7
         c.D_kwargs.channel_base //= 8
+    elif opts.cfg == 'stylegan3-v6':
+        c.G_kwargs.class_name = 'training.networks_stylegan3_ver6.Generator'
+        c.G_kwargs.num_layers = 10
+        c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))  
     else:
         c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))

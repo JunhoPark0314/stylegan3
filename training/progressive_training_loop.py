@@ -135,6 +135,15 @@ def training_loop(
     torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
     conv2d_gradfix.enabled = True                       # Improves training speed.
     grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
+
+    def pg_learning(cur_tick, total_kimg, kid, progress_term):
+        if cur_tick // kimg_per_tick == progress_term:
+            kid += 1
+            kid = min(kid, len(training_set_key) - 1)
+            progress_term *= 2
+        return kid, progress_term
+    
+    progress_fn = pg_learning
  
     # Load training set.
     if rank == 0:
@@ -186,8 +195,8 @@ def training_loop(
         z_test = torch.randn([min_batch, G.z_dim], device=device)
         c_test = torch.randn([min_batch, G.c_dim], device=device)
         for bs_test, train_set in zip(batch_size_per_key.values(), training_set_dict.values()):
-            img = misc.print_module_summary(G, [z_test, c_test, train_set.resolution])
-            misc.print_module_summary(D, [img, c_test, train_set.resolution])
+            img = misc.print_module_summary(G, [z_test, c_test, train_set.resolution, 1, None, True])
+            misc.print_module_summary(D, [img, c_test, train_set.resolution, True])
         # img = G(z, c, training_set_dict[training_set_key[0]].resolution)        
         # D(img, c, training_set_dict[training_set_key[0]].resolution)        
     # Hi Junho Park ????
@@ -285,9 +294,8 @@ def training_loop(
     maintenance_time = tick_start_time - start_time
     batch_idx = 0
     if progress_fn is not None:
-        progress_fn(0, total_kimg)
+        kid, progress_term = progress_fn(0, total_kimg, kid, progress_term)
     while True:
-
         # Initialize training set with current target key 
         ts_key = training_set_key[kid]
         batch_size = batch_size_per_key[ts_key]
@@ -361,13 +369,11 @@ def training_loop(
             adjust = np.sign(ada_stats['Loss/signs/real'] - ada_target) * (batch_size * ada_interval) / (ada_kimg * 1000)
             augment_pipe.p.copy_((augment_pipe.p + adjust).max(misc.constant(0, device=device)))
 
-        kid += 1
-        kid = min(kid, len(training_set_key) - 1)
-        
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
         if (not done) and (cur_tick != 0) and (cur_nimg < tick_start_nimg + kimg_per_tick * 1000):
             continue
+
 
         # Print status line, accumulating the same information in training_stats.
         tick_end_time = time.time()
@@ -460,13 +466,17 @@ def training_loop(
                 stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
             stats_tfevents.flush()
         if progress_fn is not None:
-            progress_fn(cur_nimg // 1000, total_kimg)
+            kid, progress_term = progress_fn(cur_nimg // 1000, total_kimg, kid, progress_term)
+        
+
 
         # Update state.
         cur_tick += 1
         tick_start_nimg = cur_nimg
         tick_start_time = time.time()
         maintenance_time = tick_start_time - tick_end_time
+
+
 
         if done:
             break
