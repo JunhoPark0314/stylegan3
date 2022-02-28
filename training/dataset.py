@@ -15,11 +15,17 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+from torch_utils import misc
+from millify import millify
 
 try:
     import pyspng
 except ImportError:
     pyspng = None
+
+TRAIN_PATH_DICT = {
+    "afhq-v2": "data/afhq-v2/afhqv2-{size}-{res}x{res}.zip"
+}
 
 #----------------------------------------------------------------------------
 
@@ -236,3 +242,77 @@ class ImageFolderDataset(Dataset):
         return labels
 
 #----------------------------------------------------------------------------
+
+def init_dataset_kwargs(class_name, data, use_labels):
+    try:
+        dataset_kwargs = dnnlib.EasyDict(class_name=class_name, path=data, use_labels=True, max_size=None, xflip=False)
+        dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # Subclass of training.dataset.Dataset.
+        # Double checking
+        dataset_kwargs.resolution = dataset_obj.resolution # Be explicit about resolution.
+        dataset_kwargs.use_labels = (dataset_obj.has_labels and use_labels) # Be explicit about labels.
+        dataset_kwargs.max_size = len(dataset_obj) # Be explicit about dataset size.
+        return dataset_kwargs
+    except IOError as err:
+        raise Exception(f'--data: {err}')
+
+class MultiResDataLoader:
+    def __init__(
+        self,
+        c,
+        rank,
+        num_gpus,
+        random_seed,
+        batch_size, 
+        use_labels,
+    ):
+        path_dict = TRAIN_PATH_DICT
+        self.dataset_name = c.dataset_name
+        self.resolution = c.resolution
+        self.cur_res = self.resolution[0]
+        max_res = max(self.resolution)
+        self.per_res_batch = {
+            res : max(4 * num_gpus, (int((res / max_res) * batch_size)) // num_gpus) * num_gpus
+            for res in self.resolution
+        }
+        self.per_res_batch_gpu = {
+            res : batch // num_gpus
+            for res, batch in self.per_res_batch.items()
+        }
+        self.per_res_ema_kimg = {
+            res : batch *10 / 32
+            for res, batch in self.per_res_batch.items()
+        }
+
+        self.dataset_kwargs = {
+            res: init_dataset_kwargs(class_name=c.class_name, use_labels=use_labels,
+                    data=path_dict[self.dataset_name].format(res=res,size=millify(c.size)))
+            for res in self.resolution
+        }
+        self.training_set = {
+            res : dnnlib.util.construct_class_by_name(**kwargs) 
+            for res, kwargs in self.dataset_kwargs.items()
+        }
+        self.training_sampler = {
+            res : misc.InfiniteSampler(dataset=training_set, rank=rank, 
+                                        num_replicas=num_gpus, seed=random_seed)
+            for res, training_set in self.training_set.items()
+        }
+        self.training_set_iterator = {
+            res : iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, 
+                    batch_size=self.per_res_batch_gpu[res], **c.loader_kwargs))
+
+            for (res, training_set), training_set_sampler in 
+                zip(self.training_set.items(), self.training_sampler.values())
+        }
+
+        self.cur_trainset = self.training_set[self.cur_res]
+        self.cur_iterator = self.training_set_iterator[self.cur_res]
+        self.cur_trainset_kwargs = self.dataset_kwargs[self.cur_res]
+    
+    def get_hyper_params(self):
+        hyper = (
+            self.per_res_batch[self.cur_res],
+            self.per_res_batch_gpu[self.cur_res],
+            self.per_res_ema_kimg[self.cur_res]
+        )
+        return hyper

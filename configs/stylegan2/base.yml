@@ -1,0 +1,13 @@
+G_kwargs:
+  fused_modconv_default: "inference_only"
+
+G_opt_kwargs:
+  lr: 0.002
+
+loss_kwargs:
+  pl_no_weight_grad: True
+  pl_weight: 2.0
+  style_mixing_prob: 0.9
+
+loop_kwargs:
+  G_reg_interval: 4

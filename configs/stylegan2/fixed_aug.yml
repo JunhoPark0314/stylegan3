@@ -1,0 +1,8 @@
+__BASE__: ['base.yml']
+
+data:
+  aug: 'fixed'
+  augment_p: 0.2
+
+loop_kwargs:
+  ada_target: 'None'

@@ -1,0 +1,14 @@
+G_kwargs:
+  class_name: 'training.networks_stylegan3.Generator'
+  magnitude_ema_beta: 
+    inline: 'lambda x : 0.5 ** (x / (20 * 1e3))'
+    key: 'batch_size'
+  conv_kernel: 1
+  channel_scale: 2
+  use_radial_filters: True
+
+loss_kwargs:
+  blur_init_sigma: 10.0
+  blur_fade_kimg:
+    inline: "lambda x : x * 200 / 32"
+    key: "batch_size"

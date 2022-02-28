@@ -403,6 +403,7 @@ class SynthesisNetwork(torch.nn.Module):
         img_channels,                   # Number of color channels.
         channel_base        = 32768,    # Overall multiplier for the number of channels.
         channel_max         = 512,      # Maximum number of channels in any layer.
+        channel_scale       = 1, 
         num_layers          = 14,       # Total number of layers, excluding Fourier features and ToRGB.
         num_critical        = 2,        # Number of critically sampled layers at the end.
         first_cutoff        = 2,        # Cutoff frequency of the first layer (f_{c,0}).
@@ -436,7 +437,7 @@ class SynthesisNetwork(torch.nn.Module):
         half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
         sizes = sampling_rates + self.margin_size * 2
         sizes[-2:] = self.img_resolution
-        channels = np.rint(np.minimum((channel_base / 2) / cutoffs, channel_max))
+        channels = np.rint(np.minimum((channel_base * channel_scale / 2) / cutoffs, channel_max * channel_scale))
         channels[-1] = self.img_channels
 
         # Construct layers.
