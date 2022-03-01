@@ -516,7 +516,7 @@ class ProgressiveTrainer(BaseTrainer):
             self.set_resolution(self.dataloader.cur_res * 2)
 
             if progress_info.rank == 0:
-                print(f'Increase target resolution from {self.dataloader.cur_res} to {self.dataloader.cur_res * 2}')
+                print(f'Increase target resolution from {self.dataloader.cur_res //2 } to {self.dataloader.cur_res}')
                 batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
                 print(f'Batch Size : {batch_size}, Batch per GPU: {batch_gpu}, ema_kimg: {ema_kimg}')
     
