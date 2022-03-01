@@ -82,8 +82,11 @@ class BaseTrainer:
         grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
 
         # Initialize with given parameters
+        self.rank = rank
         self.ema_rampup = ema_rampup
         self.ada_kimg = ada_kimg
+        self.G_reg_interval = G_reg_interval
+        self.D_reg_interval = D_reg_interval
         self.kimg_per_tick = kimg_per_tick
         self.ada_interval = ada_interval
         self.ada_target = ada_target
@@ -94,7 +97,7 @@ class BaseTrainer:
         if rank == 0:
             print('Loading training set...')
 
-        dataloader = MultiResDataLoader(
+        self.dataloader = MultiResDataLoader(
             c = cfg.data,
             rank = rank,
             num_gpus = cfg.num_gpus,
@@ -102,20 +105,22 @@ class BaseTrainer:
             batch_size = cfg.batch_size,
             use_labels = cfg.use_labels,
         )
-        self.dataloader = dataloader
         
         if rank == 0:
             print()
-            print('Num images: ', len(dataloader.cur_trainset))
-            print('Image shape:', dataloader.cur_trainset.image_shape)
-            print('Label shape:', dataloader.cur_trainset.label_shape)
+            print('Num images: ', len(self.dataloader.cur_trainset))
+            print('Image shape:', self.dataloader.cur_trainset.image_shape)
+            print('Label shape:', self.dataloader.cur_trainset.label_shape)
             print()
 
-        batch_size, batch_gpu, ema_kimg = dataloader.get_hyper_params()
+        batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
+
         # Construct networks.
         if rank == 0:
             print('Constructing networks...')
-        common_kwargs = dict(c_dim=dataloader.cur_trainset.label_dim, img_resolution=dataloader.cur_trainset.resolution, img_channels=dataloader.cur_trainset.num_channels)
+        common_kwargs = dict(c_dim=self.dataloader.cur_trainset.label_dim, 
+                            img_resolution=self.dataloader.resolution[-1], 
+                            img_channels=self.dataloader.cur_trainset.num_channels)
         self.G = dnnlib.util.construct_class_by_name(**cfg.G_kwargs, **common_kwargs).train().requires_grad_(False).to(self.device) # subclass of torch.nn.Module
         self.D = dnnlib.util.construct_class_by_name(**cfg.D_kwargs, **common_kwargs).train().requires_grad_(False).to(self.device) # subclass of torch.nn.Module
         self.G_ema = copy.deepcopy(self.G).eval()
@@ -136,7 +141,6 @@ class BaseTrainer:
             if self.ada_target is not None:
                 self.ada_stats = training_stats.Collector(regex='Loss/signs/real')
 
-        # Resume from existing pickle.
         self.pg_info  = EasyDict(
             cur_tick=0,
             cur_nimg=0,
@@ -149,6 +153,7 @@ class BaseTrainer:
             cur_res = self.dataloader.cur_res
         )
 
+        # Resume from existing pickle.
         if (cfg.resume_pkl is not None) and (rank == 0):
             print(f'Resuming from "{cfg.resume_pkl}"')
             with dnnlib.util.open_url(cfg.resume_pkl) as f:
@@ -179,29 +184,9 @@ class BaseTrainer:
             print('Setting up training phases...')
         self.loss = dnnlib.util.construct_class_by_name(device=self.device, G=self.G, D=self.D, augment_pipe=self.augment_pipe, **cfg.loss_kwargs) # subclass of training.loss.Loss
 
-        phases = []
-        for name, module, opt_kwargs, reg_interval in [('G', self.G, cfg.G_opt_kwargs, G_reg_interval), 
-                                                    ('D', self.D, cfg.D_opt_kwargs, D_reg_interval)]:
-            if reg_interval is None:
-                opt = dnnlib.util.construct_class_by_name(params=module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
-                phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
-            else: # Lazy regularization.
-                mb_ratio = reg_interval / (reg_interval + 1)
-                opt_kwargs = dnnlib.EasyDict(opt_kwargs)
-                opt_kwargs.lr = opt_kwargs.lr * mb_ratio
-                opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
-                opt = dnnlib.util.construct_class_by_name(module.parameters(), **opt_kwargs) # subclass of torch.optim.Optimizer
-                phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
-                phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
+        # Init phase informations. 
+        self.init_phase(cfg)
 
-        for phase in phases:
-            phase.start_event = None
-            phase.end_event = None
-            if rank == 0:
-                phase.start_event = torch.cuda.Event(enable_timing=True)
-                phase.end_event = torch.cuda.Event(enable_timing=True)
-        self.phases = phases
-        
         # Export sample images.
         self.snap_res = None
         if rank == 0:
@@ -227,6 +212,45 @@ class BaseTrainer:
             network_snapshot_ticks=network_snapshot_ticks
         )
         self.total_kimg = total_kimg
+
+    @classmethod
+    def get_params(self, module):
+        return module.parameters()
+    
+    def init_phase(self, cfg):
+        phases = []
+        for name, module, opt_kwargs, reg_interval in [('G', self.G, cfg.G_opt_kwargs, self.G_reg_interval), 
+                                                    ('D', self.D, cfg.D_opt_kwargs, self.D_reg_interval)]:
+            if reg_interval is None:
+                opt = dnnlib.util.construct_class_by_name(params=self.get_params(module), **opt_kwargs) # subclass of torch.optim.Optimizer
+                phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
+            else: # Lazy regularization.
+                mb_ratio = reg_interval / (reg_interval + 1)
+                opt_kwargs = dnnlib.EasyDict(opt_kwargs)
+                opt_kwargs.lr = opt_kwargs.lr * mb_ratio
+                opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
+                opt = dnnlib.util.construct_class_by_name(self.get_params(module), **opt_kwargs) # subclass of torch.optim.Optimizer
+                phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
+                phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
+
+        for phase in phases:
+            phase.start_event = None
+            phase.end_event = None
+            if self.rank == 0:
+                phase.start_event = torch.cuda.Event(enable_timing=True)
+                phase.end_event = torch.cuda.Event(enable_timing=True)
+        
+        self.phases = phases
+    
+    def set_resolution(self, res):
+        # Change parameter set of model for given resolution
+        self.G.set_resolution(res)
+        self.D.set_resolution(res)
+        self.G_ema.set_resolution(res)
+        self.dataloader.set_resolution(res)
+
+        # Re-initialize phases information based on resolution
+        self.init_phase(self.cfg)
 
     def train(self,):
         # Train.
@@ -263,11 +287,13 @@ class BaseTrainer:
             images = None
         elif self.snap_res != None:
             self.snap_res = self.dataloader.cur_res
-            gw = np.clip(7680 // self.dataloader.cur_training_set.image_shape[2], 7, 32)
-            gh = np.clip(4320 // self.dataloader.cur_training_set.image_shape[1], 4, 32)
+            batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
+
+            gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 32)
+            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 32)
             grid_size = (gw, gh)
-            grid_z = self.grid_z[:gw*gh]
-            grid_c = self.grid_c[:gw*gh]
+            grid_z = torch.cat(self.grid_z)[:gw*gh].split(batch_gpu)
+            grid_c = torch.cat(self.grid_c)[:gw*gh].split(batch_gpu)
             images = None
         else:
             # Real initialize
@@ -474,6 +500,29 @@ class BaseTrainer:
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
 
+class ProgressiveTrainer(BaseTrainer):
+    def __init__(self, *args, alpha_kimg, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.alpha_kimg = alpha_kimg
+        self.alpha_idx = 0
+        self.max_alpha_idx = int(np.log2(self.dataloader.resolution[-1] / self.dataloader.resolution[0]))
+    
+    def update_per_tick(self, progress_info):
+        super().update_per_tick(progress_info)
+
+        # change resolution if current nimg is over alpha_kimg
+        if progress_info.cur_nimg // self.alpha_kimg > self.alpha_idx and self.alpha_idx < self.max_alpha_idx:
+            self.alpha_idx = progress_info.cur_nimg // self.alpha_kimg
+            self.set_resolution(self.dataloader.cur_res * 2)
+
+            if progress_info.rank == 0:
+                print(f'Increase target resolution from {self.dataloader.cur_res} to {self.dataloader.cur_res * 2}')
+                batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
+                print(f'Batch Size : {batch_size}, Batch per GPU: {batch_gpu}, ema_kimg: {ema_kimg}')
+    
+    @classmethod
+    def get_params(self, module):
+        return module.resolution_parameters()
 
 class Logger:
     def __init__(

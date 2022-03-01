@@ -83,7 +83,8 @@ class CfgNode(CN):
 		if not isinstance(root, CfgNode):
 			return root if root != 'None' else None
 		elif hasattr(root, 'inline'):
-			result = eval(root.inline)(getattr(self, root.key))
+			lambda_args = {k: getattr(self, root[k]) for k in root.keys() if k != 'inline'}
+			result = eval(root.inline)(**lambda_args)
 			return result
 		else:
 			key_format = '{par}.{child}' if key is not None else '{child}'
@@ -92,3 +93,12 @@ class CfgNode(CN):
 				if isinstance(v, CfgNode):
 					setattr(root, k, self.calc_lambda(key_format.format(par=key, child=k),v))
 			return root
+	
+	def __getattr__(self, __k):
+		if not isinstance(__k, str):
+			return super().__getattr__(__k)
+		__klist  = __k.split('.', 1)
+		if len(__klist) == 1:
+			return super().__getattr__(__klist[0])
+		else:
+			return super().__getattr__(__klist[0]).__getattr__(__klist[1])

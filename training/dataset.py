@@ -271,7 +271,7 @@ class MultiResDataLoader:
         self.cur_res = self.resolution[0]
         max_res = max(self.resolution)
         self.per_res_batch = {
-            res : max(4 * num_gpus, (int((res / max_res) * batch_size)) // num_gpus) * num_gpus
+            res : (min(32 * num_gpus, int((max_res / res) * batch_size)) // num_gpus) * num_gpus
             for res in self.resolution
         }
         self.per_res_batch_gpu = {
@@ -316,3 +316,9 @@ class MultiResDataLoader:
             self.per_res_ema_kimg[self.cur_res]
         )
         return hyper
+    
+    def set_resolution(self, resolution):
+        self.cur_res = resolution
+        self.cur_trainset = self.training_set[self.cur_res]
+        self.cur_iterator = self.training_set_iterator[self.cur_res]
+        self.cur_trainset_kwargs = self.dataset_kwargs[self.cur_res]

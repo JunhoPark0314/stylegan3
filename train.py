@@ -18,8 +18,6 @@ import torch
 from configs import get_cfg
 
 import dnnlib
-from training import training_loop
-from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
 
@@ -108,6 +106,14 @@ def parse_comma_separated_list(s):
         return []
     return s.split(',')
 
+def parse_comma_separated_list_toint(s):
+    if isinstance(s, list):
+        return s
+    if s is None or s.lower() == 'none' or s == '':
+        return []
+    s = s.split(',')
+    return [int(s_ele) for s_ele in s]
+
 #----------------------------------------------------------------------------
 
 def parse_cfg_list(s):
@@ -139,6 +145,7 @@ def parse_cfg_list(s):
 
 # Data configuration.
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, default="afhq-v2", show_default=True)
+@click.option('--resolution',   help='Target resolution', metavar='[ZIP|DIR]',                  type=parse_comma_separated_list_toint, default="none", show_default=True)
 @click.option('--mirror',       help='Enable dataset x-flips', metavar='BOOL',                  type=bool, default=False, show_default=True)
 @click.option('--aug',          help='Augmentation mode',                                       type=click.Choice(['noaug', 'ada', 'fixed']), default='ada', show_default=True)
 @click.option('--workers',      help='DataLoader worker processes', metavar='INT',              type=click.IntRange(min=1), default=3, show_default=True)

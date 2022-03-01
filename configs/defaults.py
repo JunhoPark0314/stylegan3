@@ -85,7 +85,6 @@ _C.D_opt_kwargs.lr               = 0.002
 _C.loss_kwargs                          = CN(new_allowed=True)
 _C.loss_kwargs.class_name               = "training.loss.StyleGAN2Loss"
 _C.loss_kwargs.r1_gamma                 = 2.0
-_C.loss_kwargs.style_mixing_prob        = 0.9
 
 #===============================================================================
 # Cfg about Dataset / DataLoader configuration
@@ -138,7 +137,7 @@ _C.loop_kwargs.image_snapshot_ticks     = 20
 _C.loop_kwargs.network_snapshot_ticks   = 20
 _C.loop_kwargs.total_kimg               = 25000
 _C.loop_kwargs.D_reg_interval           = 16
-_C.loop_kwargs.kimg_per_tick            = 4000
+_C.loop_kwargs.kimg_per_tick            = 4
 _C.loop_kwargs.ada_target               = 0.6
 _C.loop_kwargs.ada_interval             = 4
 
@@ -207,6 +206,10 @@ def get_cfg(opts, cfg_list):
 
     if opts.nobench:
         cfg.cudnn_benchmark = False
+    
+    if opts.resolution:
+        cfg.data.resolution = opts.resolution
+    cfg.data.resolution = sorted(cfg.data.resolution)
     
     cfg.expr_name = extract_name(opts.cfg_file)
 

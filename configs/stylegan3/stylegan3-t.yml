@@ -2,4 +2,4 @@ G_kwargs:
   class_name: 'training.networks_stylegan3.Generator'
   magnitude_ema_beta: 
     inline: 'lambda x : 0.5 ** (x / (20 * 1e3))'
-    key: 'batch_size'
+    x: 'batch_size'
