@@ -9,6 +9,8 @@
 """Generator architecture from the paper
 "Alias-Free Generative Adversarial Networks"."""
 
+from collections import defaultdict
+from importlib.resources import path
 from typing import Iterator
 from itertools import chain
 from matplotlib.colors import to_rgb
@@ -17,6 +19,7 @@ import numpy as np
 import scipy.signal
 import scipy.optimize
 import torch
+import dnnlib
 from torch_utils import misc
 from torch_utils import persistence
 from torch_utils.ops import conv2d_gradfix
@@ -316,14 +319,15 @@ class SynthesisInput(torch.nn.Module):
 @persistence.persistent_class
 class SynthesisLayer(torch.nn.Module):
     def __init__(self,
+        # General specifications.
         w_dim,                          # Intermediate latent (W) dimensionality.
         is_torgb,                       # Is this the final ToRGB layer?
         is_critically_sampled,          # Does this layer use critical sampling?
-        use_fp16,                       # Does this layer use FP16?
-
-        # Input & output specifications.
         in_channels,                    # Number of input channels.
         out_channels,                   # Number of output channels.
+
+        # Per resolution specifications.
+        use_fp16,                       # Does this layer use FP16?
         in_size,                        # Input spatial size: int or [width, height].
         out_size,                       # Output spatial size: int or [width, height].
         in_sampling_rate,               # Input sampling rate (s).
@@ -392,8 +396,9 @@ class SynthesisLayer(torch.nn.Module):
         pad_hi = pad_total - pad_lo
         self.padding = [int(pad_lo[0]), int(pad_hi[0]), int(pad_lo[1]), int(pad_hi[1])]
 
-    def forward(self, x, w, noise_mode='random', force_fp32=False, update_emas=False):
+    def forward(self, x, w, resolution=None, alpha=None, noise_mode='random', force_fp32=False, update_emas=False):
         assert noise_mode in ['random', 'const', 'none'] # unused
+        assert (resolution is not None) and (alpha is not None)
         misc.assert_shape(x, [None, self.in_channels, int(self.in_size[1]), int(self.in_size[0])])
         misc.assert_shape(w, [x.shape[0], self.w_dim])
 
@@ -404,16 +409,34 @@ class SynthesisLayer(torch.nn.Module):
                 self.magnitude_ema.copy_(magnitude_cur.lerp(self.magnitude_ema, self.magnitude_ema_beta))
         input_gain = self.magnitude_ema.rsqrt()
 
-        # Execute affine layer.
-        styles = self.affine(w)
-        if self.is_torgb:
-            weight_gain = 1 / np.sqrt(self.in_channels * (self.conv_kernel ** 2))
-            styles = styles * weight_gain
+        path_x = {}
+        path_styles = {}
+        for path_args, affine, weight in self.paths[resolution]:
+            path_x[path_args.path] = x
 
-        # Execute modulated conv2d.
-        dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
-        x = modulated_conv2d(x=x.to(dtype), w=self.weight, s=styles,
-            padding=self.conv_kernel-1, demodulate=(not self.is_torgb), input_gain=input_gain)
+            if path_args.down_args:
+                path_x = upfirdn2d.downsample2d(path_x, **path_args.down_args)
+
+            # Execute affine layer.
+            path_styles[path_args.path] = affine(w)
+
+            if self.is_torgb:
+                weight_gain = 1 / np.sqrt(self.in_channels * (self.conv_kernel ** 2))
+                styles = styles * weight_gain
+
+            dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+            # Generate weight given alpha
+            weight = self.weight_gen(alpha=alpha, **path_args.weight_args)
+
+            # Execute modulated conv2d.
+            path_x[path_args.path] = modulated_conv2d(x=path_x[path_args.path].to(dtype), w=weight, s=path_styles[path_args.path],
+                padding=self.conv_kernel-1, demodulate=(not self.is_torgb), input_gain=input_gain)
+            
+            if path_args.up_args:
+                path_x[path_args.path] = upfirdn2d.upsample2d(path_x[path_args.path], **path_args.up_args)
+        
+        x = sum(path_x.values())
 
         # Execute bias, filtered leaky ReLU, and clamping.
         gain = 1 if self.is_torgb else np.sqrt(2)
@@ -621,8 +644,7 @@ class ToRGBModule(torch.nn.Module):
 class SynthesisNetwork(torch.nn.Module):
     def __init__(self,
         w_dim,                          # Intermediate latent (W) dimensionality.
-        img_resolution,                 # Maximum Output image resolution.
-        target_resolution,              # Initial Output image resolution.
+        target_resolutions,             # Target resolution lists
         img_channels,                   # Number of color channels.
         channel_base        = 32768,    # Overall multiplier for the number of channels.
         channel_max         = 512,      # Maximum number of channels in any layer.
@@ -641,8 +663,8 @@ class SynthesisNetwork(torch.nn.Module):
         super().__init__()
         self.w_dim = w_dim
         self.num_ws = num_layers + 2
-        self.img_resolution = img_resolution
-        self.target_resolution = target_resolution
+        self.target_resolutions = sorted(target_resolutions)
+        self.curr_resolution = target_resolutions[0]
         self.prev_resolution = None
         self.img_channels = img_channels
         self.num_layers = num_layers
@@ -652,109 +674,99 @@ class SynthesisNetwork(torch.nn.Module):
         self.num_fp16_res = num_fp16_res
         self.register_buffer("alpha", torch.ones([]))
         self.alpha_schedule = alpha_schedule
+        self.last_stopband_rel = last_stopband_rel
+        self.first_cutoff = first_cutoff
+        self.first_stopband = first_stopband
 
-        # Geometric progression of layer cutoffs and min. stopbands.
-        last_cutoff = self.img_resolution / 2 # f_{c,N}
-        last_stopband = last_cutoff * last_stopband_rel # f_{t,N}
-        exponents = np.minimum(np.arange(self.num_layers + 1) / (self.num_layers - self.num_critical), 1)
-        cutoffs = first_cutoff * (last_cutoff / first_cutoff) ** exponents # f_c[i]
-        stopbands = first_stopband * (last_stopband / first_stopband) ** exponents # f_t[i]
+        band_args_dict = dnnlib.EasyDict(**{k: self.compute_band(k) for k in zip(self.target_resolutions)})
+        channels = np.rint(np.minimum((channel_base * channel_scale / 2) / getattr(band_args_dict, max(self.target_resolutions)).cutoffs, 
+                                        channel_max * channel_scale))
 
-        # Compute remaining layer parameters.
-        sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, self.img_resolution)))) # s[i]
-        half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
-        sizes = sampling_rates + self.margin_size * 2
-        sizes[-2:] = self.img_resolution
-        channels = np.rint(np.minimum((channel_base * channel_scale / 2) / cutoffs, channel_max * channel_scale))
+        self.per_layer_band_args = self.permute_per_layer_band(band_args_dict)
         
         # Construct layers.
         self.input = SynthesisInput(
-            w_dim=self.w_dim, channels=int(channels[0]), size=int(sizes[0]),
-            sampling_rate=sampling_rates[0], bandwidth=cutoffs[0])
+            w_dim=self.w_dim, channels=int(channels[0]), **self.per_layer_band_args[0])
         self.layer_names = []
-        to_rgb_info = {}
-        trg_res = self.target_resolution
         for idx in range(self.num_layers + 1):
             prev = max(idx - 1, 0)
             is_critically_sampled = (idx >= self.num_layers - self.num_critical)
-            use_fp16 = (sampling_rates[idx] * (2 ** self.num_fp16_res) > self.img_resolution)
             layer = SynthesisLayer(
-                w_dim=self.w_dim, is_torgb=False, is_critically_sampled=is_critically_sampled, use_fp16=use_fp16,
+                w_dim=self.w_dim, is_torgb=False, is_critically_sampled=is_critically_sampled,
                 in_channels=int(channels[prev]), out_channels= int(channels[idx]),
-                in_size=int(sizes[prev]), out_size=int(sizes[idx]),
-                in_sampling_rate=int(sampling_rates[prev]), out_sampling_rate=int(sampling_rates[idx]),
-                in_cutoff=cutoffs[prev], out_cutoff=cutoffs[idx],
-                in_half_width=half_widths[prev], out_half_width=half_widths[idx], 
-                **layer_kwargs)
-            name = f'L{idx}_{layer.out_size[0]}_{layer.out_channels}'
+                **self.per_layer_band_args[idx],
+                **layer_kwargs
+            )
+            name = f'L{idx}_{layer.out_channels}'
             setattr(self, name, layer)
             self.layer_names.append(name)
+    
+    def permute_per_layer_band(self, band_args_dict):
+        per_layer_band_args = []
+        # Add input band args
 
-            if int(cutoffs[idx]) >= trg_res // 2 and (trg_res != img_resolution):
-                cur_res_info = {
-                    "in_channels" : int(channels[prev]),
-                    "sampling_rate": int(sampling_rates[prev]),
-                    "cutoff": cutoffs[prev],
-                    "half_width": half_widths[prev],
-                    "use_fp16": use_fp16,
-                    "in_size": int(sizes[prev]),
-                    "out_size": trg_res,
-                    "img_channels": self.img_channels
-                }
-                getattr(self, self.layer_names[-2]).target_resolution = trg_res
-                to_rgb_info[trg_res] = cur_res_info
-                trg_res *=2
+        # Add per layer band args
+        for idx in range(self.num_layers + 1):
+            prev = max(idx - 1, 0)
+            idx_band_args = dnnlib.EasyDict(
+                use_fp16={}, in_size={}, out_size={},
+                in_sampling_rate={}, out_sampling_rate={}, 
+                in_cutoff={}, out_cutoff={},
+                in_half_width={}, out_half_width={}
+            )
+            for res, args in band_args_dict.items():
+                use_fp16 = (args.sampling_rates[idx] * (2 ** self.num_fp16_res) > self.target_resolutions[-1])
+                idx_band_args.use_fp16[res] = use_fp16
+                idx_band_args.in_size[res] = args.sizes[prev]
+                idx_band_args.in_sampling_rate[res] = args.sampling_rates[prev]
+                idx_band_args.out_sampling_rate[res] = args.sampling_rates[idx]
+                idx_band_args.in_cutoff[res] = args.cutoffs[prev] 
+                idx_band_args.out_cutoff[res] = args.cutoffs[idx]
+                idx_band_args.in_half_width[res] = args.half_widths[prev] 
+                idx_band_args.out_half_width[res] = args.half_widths[idx]
+
+            per_layer_band_args.append(idx_band_args)
         
-        last_res_info = {
-            "in_channels" : int(channels[-1]),
-            "sampling_rate": int(sampling_rates[-1]),
-            "cutoff": cutoffs[-1],
-            "half_width": half_widths[-1],
-            "use_fp16": use_fp16,
-            "in_size": int(sizes[-1]),
-            "out_size": img_resolution,
-            "img_channels": self.img_channels
-        }
-        getattr(self, self.layer_names[-1]).target_resolution = img_resolution
-        to_rgb_info[img_resolution] = last_res_info
-        self.to_rgb_info = to_rgb_info
-        
-        self.to_rgb_names = {}
-        for res, cur_res_info in to_rgb_info.items():
-            cur_res_info.update(layer_kwargs)
-            torgb_module = ToRGBModule(w_dim=self.w_dim, is_critically_sampled=True,
-             **cur_res_info)
-            name = f'TRGB{res}_{cur_res_info["in_channels"]}'
-            setattr(self, name, torgb_module)
-            self.to_rgb_names[res] = name
+        return per_layer_band_args
+
+    def compute_band(self, img_resolution):
+        # Geometric progression of layer cutoffs and min. stopbands.
+        last_cutoff = img_resolution / 2 # f_{c,N}
+        last_stopband = last_cutoff * self.last_stopband_rel # f_{t,N}
+        exponents = np.minimum(np.arange(self.num_layers + 1) / (self.num_layers - self.num_critical), 1)
+        cutoffs = self.first_cutoff * (last_cutoff / self.first_cutoff) ** exponents # f_c[i]
+        stopbands = self.first_stopband * (last_stopband / self.first_stopband) ** exponents # f_t[i]
+
+        # Compute remaining layer parameters.
+        sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, img_resolution)))) # s[i]
+        half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
+        sizes = sampling_rates + self.margin_size * 2
+        sizes[-2:] = img_resolution
+
+        return dnnlib.EasyDict(
+            cutoffs=cutoffs,
+            stopbands=stopbands,
+            half_widths=half_widths,
+            sampling_rates=sampling_rates,
+            sizes=sizes
+        )
 
     def forward(self, ws, **layer_kwargs):
         misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
         ws = ws.to(torch.float32).unbind(dim=1)
-        # if layer_kwargs["update_emas"]:
-        #     self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule * len(ws)), min=0, max=1))
+        if layer_kwargs["update_emas"]:
+            self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule), min=0, max=1))
 
         # Execute layers.
         x = self.input(ws[0])
-        prev_x = 0
         for name, w in zip(self.layer_names, ws[1:]):
-            x = getattr(self, name)(x, w, **layer_kwargs)
-
-            if getattr(self, name).target_resolution == self.target_resolution:
-                x = getattr(self, self.to_rgb_names[self.target_resolution])(x, w, **layer_kwargs)
-                x = (1 - self.alpha) * prev_x + self.alpha * x
-                break
-
-            if self.prev_resolution and getattr(self, name).target_resolution == self.prev_resolution:
-                prev_x = getattr(self, self.to_rgb_names[self.prev_resolution])(x, w, **layer_kwargs)
-                up_filter = getattr(self, self.to_rgb_names[self.target_resolution]).up_filter
-                prev_x = upfirdn2d.upsample2d(prev_x, up_filter, up=2, padding=0, flip_filter=True, gain=1)
+            x = getattr(self, name)(x, w, resolution=self.curr_resolution, alpha=self.alpha, **layer_kwargs)
 
         if self.output_scale != 1:
             x = x * self.output_scale
 
         # Ensure correct shape and dtype.
-        misc.assert_shape(x, [None, self.img_channels, self.target_resolution, self.target_resolution])
+        misc.assert_shape(x, [None, self.img_channels, self.curr_resolution, self.curr_resolution])
         x = x.to(torch.float32)
         return x
 
@@ -791,7 +803,7 @@ class Generator(torch.nn.Module):
         z_dim,                      # Input latent (Z) dimensionality.
         c_dim,                      # Conditioning label (C) dimensionality.
         w_dim,                      # Intermediate latent (W) dimensionality.
-        img_resolution,             # Output resolution.
+        target_resolutions,         # Target resolution lists.
         img_channels,               # Number of output color channels.
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         **synthesis_kwargs,         # Arguments for SynthesisNetwork.
@@ -800,9 +812,9 @@ class Generator(torch.nn.Module):
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
-        self.img_resolution = img_resolution
+        self.target_resolutions = target_resolutions
         self.img_channels = img_channels
-        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.synthesis = SynthesisNetwork(w_dim=w_dim, target_resolutions=target_resolutions, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
@@ -811,10 +823,10 @@ class Generator(torch.nn.Module):
         img = self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
         return img
     
-    def set_resolution(self, resolution):
-        self.synthesis.prev_resolution = self.synthesis.target_resolution
-        self.synthesis.target_resolution = resolution
-        self.synthesis.alpha.copy_(torch.zeros([], device=self.synthesis.alpha.device))
+    def set_resolution(self, prev_resolution, cur_resolution, alpha=0):
+        self.synthesis.prev_resolution = prev_resolution
+        self.synthesis.curr_resolution = cur_resolution
+        self.synthesis.alpha.copy_(torch.ones([], device=self.synthesis.alpha.device) * alpha)
     
     def resolution_parameters(self):
         ws_params = self.mapping.parameters()
@@ -1027,8 +1039,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
 class Discriminator(torch.nn.Module):
     def __init__(self,
         c_dim,                          # Conditioning label (C) dimensionality.
-        img_resolution,                 # Maximum input resolution.
-        target_resolution,              # Initial input resolution.
+        target_resolutions,             # Target resolution list.
         img_channels,                   # Number of input color channels.
         architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,    # Overall multiplier for the number of channels.
@@ -1078,8 +1089,8 @@ class Discriminator(torch.nn.Module):
         self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
  
     def forward(self, img, c, update_emas=False, **block_kwargs):
-        # if update_emas:
-        #     self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule * len(img)), min=0, max=1))
+        if update_emas:
+            self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule), min=0, max=1))
 
         target_x, img = getattr(self, f'b{self.target_resolution}')(None, img, frgb=True, **block_kwargs)
         x, img = getattr(self, f'b{self.prev_resolution}')(target_x, img, alpha=self.alpha, frgb=True, **block_kwargs)  \

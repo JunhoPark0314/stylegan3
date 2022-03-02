@@ -118,9 +118,8 @@ class BaseTrainer:
         # Construct networks.
         if rank == 0:
             print('Constructing networks...')
-        common_kwargs = dict(c_dim=self.dataloader.cur_trainset.label_dim, 
-                            img_resolution=self.dataloader.resolution[-1], 
-                            img_channels=self.dataloader.cur_trainset.num_channels)
+
+        common_kwargs = self.get_network_kwargs()
         self.G = dnnlib.util.construct_class_by_name(**cfg.G_kwargs, **common_kwargs).train().requires_grad_(False).to(self.device) # subclass of torch.nn.Module
         self.D = dnnlib.util.construct_class_by_name(**cfg.D_kwargs, **common_kwargs).train().requires_grad_(False).to(self.device) # subclass of torch.nn.Module
         self.G_ema = copy.deepcopy(self.G).eval()
@@ -212,6 +211,11 @@ class BaseTrainer:
             network_snapshot_ticks=network_snapshot_ticks
         )
         self.total_kimg = total_kimg
+    
+    def get_network_kwargs(self):
+        return dict(c_dim=self.dataloader.cur_trainset.label_dim, 
+                    img_resolution=self.dataloader.resolution[-1], 
+                    img_channels=self.dataloader.cur_trainset.num_channels)
 
     @classmethod
     def get_params(self, module):
@@ -499,6 +503,11 @@ class ProgressiveTrainer(BaseTrainer):
         self.alpha_kimg = alpha_kimg
         self.alpha_idx = 0
         self.max_alpha_idx = int(np.log2(self.dataloader.resolution[-1] / self.dataloader.resolution[0]))
+
+    def get_network_kwargs(self):
+        return dict(c_dim=self.dataloader.cur_trainset.label_dim, 
+                    target_resolutions=self.dataloader.resolution, 
+                    img_channels=self.dataloader.cur_trainset.num_channels)
     
     def update_per_tick(self, progress_info):
         super().update_per_tick(progress_info)
