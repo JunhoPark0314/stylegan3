@@ -731,8 +731,8 @@ class SynthesisNetwork(torch.nn.Module):
     def forward(self, ws, **layer_kwargs):
         misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
         ws = ws.to(torch.float32).unbind(dim=1)
-        if layer_kwargs["update_emas"]:
-            self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule), min=0, max=1))
+        # if layer_kwargs["update_emas"]:
+        #     self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule * len(ws)), min=0, max=1))
 
         # Execute layers.
         x = self.input(ws[0])
@@ -1078,8 +1078,8 @@ class Discriminator(torch.nn.Module):
         self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
  
     def forward(self, img, c, update_emas=False, **block_kwargs):
-        if update_emas:
-            self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule), min=0, max=1))
+        # if update_emas:
+        #     self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule * len(img)), min=0, max=1))
 
         target_x, img = getattr(self, f'b{self.target_resolution}')(None, img, frgb=True, **block_kwargs)
         x, img = getattr(self, f'b{self.prev_resolution}')(target_x, img, alpha=self.alpha, frgb=True, **block_kwargs)  \

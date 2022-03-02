@@ -194,7 +194,6 @@ def get_cfg(opts, cfg_list):
     # Get default cfgs and merge with target cfg file
     cfg = get_cfg_defaults()
     cfg.merge_from_file(opts.cfg_file)
-    cfg.clear_build()
 
     # Update argument unaware cfgs based on initialized cfg (e.g. FP32, benchmark)
     if opts.snap:
@@ -214,6 +213,7 @@ def get_cfg(opts, cfg_list):
     cfg.expr_name = extract_name(opts.cfg_file)
 
     cfg.merge_from_list(cfg_list)
+    cfg.clear_build()
 
     # Update argument aware cfgs based on initialized cfg (e.g. Batch size, )
     cfg.ema_kimg = cfg.batch_size * 10 / 32

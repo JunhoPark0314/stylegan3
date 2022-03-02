@@ -219,8 +219,8 @@ class BaseTrainer:
     
     def init_phase(self, cfg):
         phases = []
-        for name, module, opt_kwargs, reg_interval in [('G', self.G, cfg.G_opt_kwargs, self.G_reg_interval), 
-                                                    ('D', self.D, cfg.D_opt_kwargs, self.D_reg_interval)]:
+        for idx, (name, module, opt_kwargs, reg_interval) in enumerate([('G', self.G, cfg.G_opt_kwargs, self.G_reg_interval), 
+                                                    ('D', self.D, cfg.D_opt_kwargs, self.D_reg_interval)]):
             if reg_interval is None:
                 opt = dnnlib.util.construct_class_by_name(params=self.get_params(module), **opt_kwargs) # subclass of torch.optim.Optimizer
                 phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
@@ -232,6 +232,9 @@ class BaseTrainer:
                 opt = dnnlib.util.construct_class_by_name(self.get_params(module), **opt_kwargs) # subclass of torch.optim.Optimizer
                 phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
                 phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
+            
+            if hasattr(self, 'phases'):
+                phases[-1]['opt'].load_state_dict(self.phases[idx]['opt'].state_dict())
 
         for phase in phases:
             phase.start_event = None
@@ -280,30 +283,23 @@ class BaseTrainer:
             print('Exiting...')
 
     def setup_snapshot_image_grid(self):
-        if self.snap_res == self.dataloader.cur_res:
-            grid_z = self.grid_z
-            grid_c = self.grid_c
-            grid_size = self.grid_size
-            images = None
-        elif self.snap_res != None:
+        if (self.snap_res != None) and (self.snap_res != self.dataloader.cur_res):
             self.snap_res = self.dataloader.cur_res
             batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-
             gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 32)
             gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 32)
-            grid_size = (gw, gh)
-            grid_z = torch.cat(self.grid_z)[:gw*gh].split(batch_gpu)
-            grid_c = torch.cat(self.grid_c)[:gw*gh].split(batch_gpu)
-            images = None
-        else:
+            self.grid_size = (gw, gh)
+            self.grid_z = torch.cat(self.grid_z)[:gw*gh].split(batch_gpu)
+            self.grid_c = torch.cat(self.grid_c)[:gw*gh].split(batch_gpu)
+        elif self.snap_res == None:
             # Real initialize
             self.snap_res = self.dataloader.cur_res
             batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
             training_set = self.dataloader.cur_trainset
 
             rnd = np.random.RandomState(self.seed)
-            gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-            gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+            gw = np.clip(1080 // training_set.image_shape[2], 7, 32)
+            gh = np.clip(1920 // training_set.image_shape[1], 4, 32)
 
             # No labels => show random subset of training samples.
             if not training_set.has_labels:
@@ -334,16 +330,13 @@ class BaseTrainer:
 
             # Load data.
             images, labels = zip(*[training_set[i] for i in grid_indices])
-            images = np.stack(images)
+            self.images = np.stack(images)
             labels = np.stack(labels)
             self.grid_z = torch.randn([labels.shape[0], self.G.z_dim], device=self.device).split(batch_gpu)
             self.grid_c = torch.from_numpy(labels).to(self.device).split(batch_gpu)
             self.grid_size = (gw, gh)
-            grid_z = self.grid_z
-            grid_c = self.grid_c
-            grid_size = self.grid_size
 
-        return grid_size, grid_z, grid_c, images
+        return self.grid_size, self.grid_z, self.grid_c, self.images
 
     def update_per_tick(
         self,
@@ -519,10 +512,18 @@ class ProgressiveTrainer(BaseTrainer):
                 print(f'Increase target resolution from {self.dataloader.cur_res //2 } to {self.dataloader.cur_res}')
                 batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
                 print(f'Batch Size : {batch_size}, Batch per GPU: {batch_gpu}, ema_kimg: {ema_kimg}')
-    
+
     @classmethod
     def get_params(self, module):
-        return module.resolution_parameters()
+        return module.parameters()
+
+    def update_per_batch(
+        self,
+        progress_info,
+    ):
+        super().update_per_batch(progress_info)
+        self.G.synthesis.alpha.copy_(torch.clip(torch.ones([]) * (progress_info.cur_nimg / self.alpha_kimg - self.alpha_idx), min=0, max=1))
+        self.D.alpha.copy_(torch.clip(torch.ones([]) * (progress_info.cur_nimg / self.alpha_kimg - self.alpha_idx), min=0, max=1))
 
 class Logger:
     def __init__(
