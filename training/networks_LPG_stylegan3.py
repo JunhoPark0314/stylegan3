@@ -621,8 +621,7 @@ class ToRGBModule(torch.nn.Module):
 class SynthesisNetwork(torch.nn.Module):
     def __init__(self,
         w_dim,                          # Intermediate latent (W) dimensionality.
-        img_resolution,                 # Maximum Output image resolution.
-        target_resolution,              # Initial Output image resolution.
+        target_resolutions,             # Target image resolution list.
         img_channels,                   # Number of color channels.
         channel_base        = 32768,    # Overall multiplier for the number of channels.
         channel_max         = 512,      # Maximum number of channels in any layer.
@@ -641,8 +640,8 @@ class SynthesisNetwork(torch.nn.Module):
         super().__init__()
         self.w_dim = w_dim
         self.num_ws = num_layers + 2
-        self.img_resolution = img_resolution
-        self.target_resolution = target_resolution
+        self.img_resolution = target_resolutions[-1]
+        self.target_resolution = target_resolutions[0]
         self.prev_resolution = None
         self.img_channels = img_channels
         self.num_layers = num_layers
@@ -690,7 +689,7 @@ class SynthesisNetwork(torch.nn.Module):
             setattr(self, name, layer)
             self.layer_names.append(name)
 
-            if int(cutoffs[idx]) >= trg_res // 2 and (trg_res != img_resolution):
+            if int(cutoffs[idx]) >= trg_res // 2 and (trg_res != self.img_resolution):
                 cur_res_info = {
                     "in_channels" : int(channels[prev]),
                     "sampling_rate": int(sampling_rates[prev]),
@@ -712,11 +711,11 @@ class SynthesisNetwork(torch.nn.Module):
             "half_width": half_widths[-1],
             "use_fp16": use_fp16,
             "in_size": int(sizes[-1]),
-            "out_size": img_resolution,
+            "out_size": self.img_resolution,
             "img_channels": self.img_channels
         }
-        getattr(self, self.layer_names[-1]).target_resolution = img_resolution
-        to_rgb_info[img_resolution] = last_res_info
+        getattr(self, self.layer_names[-1]).target_resolution = self.img_resolution
+        to_rgb_info[self.img_resolution] = last_res_info
         self.to_rgb_info = to_rgb_info
         
         self.to_rgb_names = {}
@@ -791,7 +790,7 @@ class Generator(torch.nn.Module):
         z_dim,                      # Input latent (Z) dimensionality.
         c_dim,                      # Conditioning label (C) dimensionality.
         w_dim,                      # Intermediate latent (W) dimensionality.
-        img_resolution,             # Output resolution.
+        target_resolutions,         # Target resolution list.
         img_channels,               # Number of output color channels.
         mapping_kwargs      = {},   # Arguments for MappingNetwork.
         **synthesis_kwargs,         # Arguments for SynthesisNetwork.
@@ -800,9 +799,9 @@ class Generator(torch.nn.Module):
         self.z_dim = z_dim
         self.c_dim = c_dim
         self.w_dim = w_dim
-        self.img_resolution = img_resolution
+        self.img_resolution = target_resolutions[-1]
         self.img_channels = img_channels
-        self.synthesis = SynthesisNetwork(w_dim=w_dim, img_resolution=img_resolution, img_channels=img_channels, **synthesis_kwargs)
+        self.synthesis = SynthesisNetwork(w_dim=w_dim, target_resolutions=target_resolutions, img_channels=img_channels, **synthesis_kwargs)
         self.num_ws = self.synthesis.num_ws
         self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
 
@@ -1027,8 +1026,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
 class Discriminator(torch.nn.Module):
     def __init__(self,
         c_dim,                          # Conditioning label (C) dimensionality.
-        img_resolution,                 # Maximum input resolution.
-        target_resolution,              # Initial input resolution.
+        target_resolutions,             # Target resolution lists.
         img_channels,                   # Number of input color channels.
         architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
         channel_base        = 32768,    # Overall multiplier for the number of channels.
@@ -1043,10 +1041,10 @@ class Discriminator(torch.nn.Module):
     ):
         super().__init__()
         self.c_dim = c_dim
-        self.img_resolution = img_resolution
-        self.target_resolution = target_resolution
+        self.img_resolution = target_resolutions[-1]
+        self.target_resolution =target_resolutions[0] 
         self.prev_resolution = None
-        self.img_resolution_log2 = int(np.log2(img_resolution))
+        self.img_resolution_log2 = int(np.log2(self.img_resolution))
         self.img_channels = img_channels
         self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
         self.register_buffer("alpha", torch.ones([]))
@@ -1064,11 +1062,11 @@ class Discriminator(torch.nn.Module):
         cur_layer_idx = 0
 
         for res in self.block_resolutions:
-            in_channels = channels_dict[res] if res < img_resolution else 0
+            in_channels = channels_dict[res] if res < self.img_resolution else 0
             tmp_channels = channels_dict[res]
             out_channels = channels_dict[res // 2]
             use_fp16 = (res >= fp16_resolution)
-            frgb = res >= target_resolution
+            frgb = res >= self.target_resolution
             block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res,
                 first_layer_idx=cur_layer_idx, use_fp16=use_fp16, frgb=frgb, **block_kwargs, **common_kwargs)
             setattr(self, f'b{res}', block)
