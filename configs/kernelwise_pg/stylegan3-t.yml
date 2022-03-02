@@ -1,5 +1,5 @@
 G_kwargs:
-  class_name: 'training.networks_progressive_stylegan3.Generator'
+  class_name: 'training.networks_KPG_stylegan3.Generator'
   alpha_schedule:
     inline: 'lambda x,y : 1 / (y / x)'
     x: 'batch_size'
@@ -12,7 +12,7 @@ G_kwargs:
     x: 'batch_size'
 
 D_kwargs:
-  class_name: 'training.networks_progressive_stylegan3.Discriminator'
+  class_name: 'training.networks_KPG_stylegan3.Discriminator'
   alpha_schedule:
     inline: 'lambda x,y : 1 / (y / x)'
     x: 'batch_size'
