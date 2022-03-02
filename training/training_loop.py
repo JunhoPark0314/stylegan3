@@ -531,8 +531,10 @@ class ProgressiveTrainer(BaseTrainer):
         progress_info,
     ):
         super().update_per_batch(progress_info)
-        self.G.synthesis.alpha.copy_(torch.clip(torch.ones([]) * (progress_info.cur_nimg / self.alpha_kimg - self.alpha_idx), min=0, max=1))
-        self.D.alpha.copy_(torch.clip(torch.ones([]) * (progress_info.cur_nimg / self.alpha_kimg - self.alpha_idx), min=0, max=1))
+        batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
+        cur_alpha = torch.ones([]) * (batch_size / self.alpha_kimg)
+        self.G.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
+        self.D.alpha.copy_(torch.clip(self.D.alpha + cur_alpha, min=0, max=1))
 
 class Logger:
     def __init__(
