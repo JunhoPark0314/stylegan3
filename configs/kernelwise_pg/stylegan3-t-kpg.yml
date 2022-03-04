@@ -4,13 +4,10 @@ G_kwargs:
     inline: 'lambda x,y : 1 / y'
     x: 'batch_size'
     y: 'loop_kwargs.alpha_kimg' 
-  target_resolution:
-    inline: 'lambda x : x[0]'
-    x: 'data.resolution'
   magnitude_ema_beta: 
     inline: 'lambda x : 0.5 ** (x / (20 * 1e3))'
     x: 'batch_size'
-  num_layers: 14
+  num_layers: 8
   num_critical: 2
 
 D_kwargs:
@@ -19,12 +16,10 @@ D_kwargs:
     inline: 'lambda x,y : 1 / y'
     x: 'batch_size'
     y: 'loop_kwargs.alpha_kimg' 
-  target_resolution:
-    inline: 'lambda x : x[0]'
-    x: 'data.resolution'
 
 data:
   resolution: [32, 64, 128, 256, 512]
+  max_batch : 32
 
 loop_kwargs:
   class_name: 'training.training_loop.ProgressiveTrainer'

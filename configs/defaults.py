@@ -100,6 +100,7 @@ _C.data.resolution                      = [128,]
 _C.data.class_name                      = "training.dataset.ImageFolderDataset"
 _C.data.aug                             = "ada"
 _C.data.augment_p                       = 0.0
+_C.data.max_batch                       = 32
 
 
 _C.data.loader_kwargs                   = CN()

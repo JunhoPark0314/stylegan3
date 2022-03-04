@@ -78,7 +78,7 @@ def suppress_tracer_warnings():
 # Assert that the shape of a tensor matches the given list of integers.
 # None indicates that the size of a dimension is allowed to vary.
 # Performs symbolic assertion when used in torch.jit.trace().
-
+ 
 def assert_shape(tensor, ref_shape):
     if tensor.ndim != len(ref_shape):
         raise AssertionError(f'Wrong number of dimensions: got {tensor.ndim}, expected {len(ref_shape)}')
