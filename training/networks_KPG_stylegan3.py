@@ -152,11 +152,12 @@ class Conv2dLayer(torch.nn.Module):
 			else:
 				self.bias = None
 
-	def forward(self, x, gain=1):
+	def forward(self, x, gain=1, down=None):
+		curr_down = down if down != None else self.down
 		w = self.weight * self.weight_gain
 		b = self.bias.to(x.dtype) if self.bias is not None else None
 		flip_weight = (self.up == 1) # slightly faster
-		x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=self.down, padding=self.padding, flip_weight=flip_weight)
+		x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=curr_down, padding=self.padding, flip_weight=flip_weight)
 
 		act_gain = self.act_gain * gain
 		act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
@@ -327,7 +328,7 @@ class SynthesisKernel(torch.nn.Module):
 		self.out_channels = out_channels
 		self.ks = ks
 		self.sampling_rate = sampling_rate
-		self.bandlimit = max(sampling_rate)
+		self.bandlimit = max(sampling_rate) // 2
 		self.freq_dim = freq_dim
 		
 		# Create uniform distribution on disk
@@ -343,6 +344,8 @@ class SynthesisKernel(torch.nn.Module):
 		self.gain = np.sqrt(2 / in_channels)
 
 	def forward(self, target_sampling_rate, device, alpha=None):
+		if alpha == None:
+			alpha = 1
 		# Sample signal
 		sample_size = self.ks
 		freqs = self.freqs.unsqueeze(0)
@@ -363,10 +366,10 @@ class SynthesisKernel(torch.nn.Module):
 		freq_norm = freqs.norm(dim=-1)
 
 		if target_sampling_rate != min(self.sampling_rate):
-			low_cutoff = target_sampling_rate // 2
+			low_cutoff = target_sampling_rate // 4
 			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
 
-		high_cutoff = alpha * target_sampling_rate + (1 - alpha) * (target_sampling_rate // 2)
+		high_cutoff = alpha * target_sampling_rate//2 + (1 - alpha) * (target_sampling_rate // 4)
 		high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 
 		x = x * high_filter * low_filter
@@ -1034,8 +1037,6 @@ class SynthesisNetwork(torch.nn.Module):
 	def forward(self, ws, **layer_kwargs):
 		misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
 		ws = ws.to(torch.float32).unbind(dim=1)
-		if layer_kwargs["update_emas"]:
-			self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule), min=0, max=1))
 
 		# Execute layers.
 		x = self.input(ws[0])
@@ -1123,6 +1124,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		tmp_channels,                       # Number of intermediate channels.
 		out_channels,                       # Number of output channels.
 		resolution,                         # Resolution of this block.
+		target_resolutions,					# Resolution of Discriminator targets
 		img_channels,                       # Number of input color channels.
 		first_layer_idx,                    # Index of the first layer.
 		architecture        = 'resnet',     # Architecture: 'orig', 'skip', 'resnet'.
@@ -1139,6 +1141,8 @@ class DiscriminatorBlock(torch.nn.Module):
 		super().__init__()
 		self.in_channels = in_channels
 		self.resolution = resolution
+		min_res = max(self.resolution, min(target_resolutions))
+		self.target_resolutions = sorted([s for s in set(target_resolutions) if s <= min_res])
 		self.img_channels = img_channels
 		self.first_layer_idx = first_layer_idx
 		self.architecture = architecture
@@ -1159,45 +1163,74 @@ class DiscriminatorBlock(torch.nn.Module):
 			self.fromrgb = Conv2dLayer(img_channels, tmp_channels, kernel_size=1, activation=activation,
 				trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
 
-		self.conv0 = Conv2dLayer(tmp_channels, tmp_channels, kernel_size=3, activation=activation,
-			trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
+		self.kernel_size = 3
+		self.conv_clamp = conv_clamp
+		self.activation = activation
+		self.act_gain = bias_act.activation_funcs[activation].def_gain
+		self.conv0_weight = SynthesisKernel(tmp_channels, tmp_channels, ks=self.kernel_size, sampling_rate=self.target_resolutions)
+		self.conv0_bias = torch.nn.Parameter(torch.zeros([tmp_channels]))
+		self.conv1_weight = SynthesisKernel(tmp_channels, out_channels, ks=self.kernel_size, sampling_rate=self.target_resolutions)
+		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
 
-		self.conv1 = Conv2dLayer(tmp_channels, out_channels, kernel_size=3, activation=activation, down=2,
-			trainable=next(trainable_iter), resample_filter=resample_filter, conv_clamp=conv_clamp, channels_last=self.channels_last)
 
 		if architecture == 'resnet':
 			self.skip = Conv2dLayer(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
 				trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
 
-	def forward(self, x, img, alpha=None, force_fp32=False, frgb=False):
+	def forward(self, x, img, resolution, alpha=None, force_fp32=False):
 		if (x if x is not None else img).device.type != 'cuda':
 			force_fp32 = True
 		dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
 		memory_format = torch.channels_last if self.channels_last and not force_fp32 else torch.contiguous_format
+		sample_size = min(self.resolution, resolution)
+		curr_down = 2 if sample_size == self.resolution else 1
 
 		# Input.
 		if x is not None:
-			misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution])
+			misc.assert_shape(x, [None, self.in_channels, sample_size, sample_size])
 			x = x.to(dtype=dtype, memory_format=memory_format)
 
 		# FromRGB.
-		if self.in_channels == 0 or self.architecture == 'skip' or frgb:
-			misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
+		if self.in_channels == 0 or self.architecture == 'skip':
+			misc.assert_shape(img, [None, self.img_channels, sample_size, sample_size])
 			img = img.to(dtype=dtype, memory_format=memory_format)
 			y = self.fromrgb(img)
-			if alpha is None:
-				a_x = a_y = 1
-			else:
-				a_x = alpha
-				a_y = 1 - alpha
-			x = a_x * x + a_y * y if x is not None else y
-			img = upfirdn2d.downsample2d(img, self.resample_filter) if (self.architecture == 'skip' or frgb) else None
+			x = x + y if x is not None else y
+			img = upfirdn2d.downsample2d(img, self.resample_filter) if (self.architecture == 'skip') else None
 
 		# Main layers.
 		if self.architecture == 'resnet':
-			y = self.skip(x, gain=np.sqrt(0.5))
-			x = self.conv0(x)
-			x = self.conv1(x, gain=np.sqrt(0.5))
+			y = self.skip(x, gain=np.sqrt(0.5), down=curr_down)
+
+			conv0_x = {}
+			conv0_w = {}
+			for res in self.target_resolutions:
+				if res > resolution:
+					break
+				curr_alpha = alpha if res == resolution else 1
+				conv0_w[res] = self.conv0_weight(res, x.device, curr_alpha).to(dtype=x.dtype)
+				conv0_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=resolution // res)
+				conv0_x[res] = conv2d_resample.conv2d_resample(x=conv0_x[res], w=conv0_w[res], padding=self.kernel_size//2)
+				conv0_x[res] = upfirdn2d.upsample2d(conv0_x[res], self.resample_filter, up=resolution // res).unsqueeze(0)
+
+			conv0_x = torch.cat(list(conv0_x.values()), dim=0).sum(dim=0)
+			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
+			x = bias_act.bias_act(conv0_x, self.conv0_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain, clamp=act_clamp)
+
+			conv1_x = {}
+			conv1_w = {}
+			for res in self.target_resolutions:
+				if res > resolution:
+					break
+				curr_alpha = alpha if res == resolution else 1
+				conv1_w[res] = self.conv1_weight(res, x.device, curr_alpha).to(dtype=x.dtype)
+				conv1_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=resolution // res)
+				conv1_x[res] = conv2d_resample.conv2d_resample(x=conv1_x[res], w=conv1_w[res], padding=self.kernel_size//2)
+				conv1_x[res] = upfirdn2d.upsample2d(conv1_x[res], self.resample_filter, up=resolution // res).unsqueeze(0)
+			conv1_x = torch.cat(list(conv1_x.values()), dim=0).sum(dim=0)
+			conv1_x = upfirdn2d.downsample2d(conv1_x, self.resample_filter, down=curr_down)
+			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
+			x = bias_act.bias_act(conv1_x, self.conv1_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain * 0.5, clamp=act_clamp)
 			x = y.add_(x)
 		else:
 			x = self.conv0(x)
@@ -1355,6 +1388,7 @@ class Discriminator(torch.nn.Module):
 
 		common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
 		cur_layer_idx = 0
+		min_res = min(self.target_resolutions)
 
 		for res in self.block_resolutions:
 			in_channels = channels_dict[res] if res < self.max_resolution else 0
@@ -1362,7 +1396,7 @@ class Discriminator(torch.nn.Module):
 			out_channels = channels_dict[res // 2]
 			use_fp16 = (res >= fp16_resolution)
 			frgb = res >= self.curr_resolution
-			block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res,
+			block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res, target_resolutions=self.target_resolutions,
 				first_layer_idx=cur_layer_idx, use_fp16=use_fp16, frgb=frgb, **block_kwargs, **common_kwargs)
 			setattr(self, f'b{res}', block)
 			cur_layer_idx += block.num_layers
@@ -1371,19 +1405,10 @@ class Discriminator(torch.nn.Module):
 		self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
  
 	def forward(self, img, c, update_emas=False, **block_kwargs):
-		if update_emas:
-			self.alpha.copy_(torch.clip(self.alpha.add_(self.alpha_schedule), min=0, max=1))
-
-		target_x, img = getattr(self, f'b{self.curr_resolution}')(None, img, frgb=True, **block_kwargs)
-		x, img = getattr(self, f'b{self.prev_resolution}')(target_x, img, alpha=self.alpha, frgb=True, **block_kwargs)  \
-							if self.prev_resolution else (target_x, img)
-		start_res = self.prev_resolution // 2 if self.prev_resolution else self.curr_resolution // 2
-
+		x = None
 		for res in self.block_resolutions:
-			if res > start_res:
-				continue
 			block = getattr(self, f'b{res}')
-			x, img = block(x, img, **block_kwargs)
+			x, img = block(x, img, self.curr_resolution, alpha=self.alpha, **block_kwargs)
 
 		cmap = None
 		if self.c_dim > 0:
@@ -1401,22 +1426,4 @@ class Discriminator(torch.nn.Module):
 	
 	def resolution_parameters(self) -> Iterator[Parameter]:
 		return self.parameters()
-		# b4 parameters
-		last_params = self.b4.parameters()
-
-		# Feature backbone parameters
-		cur_res_params = [last_params]
-		for res in self.block_resolutions:
-			layer = f'b{res}'
-			if res > self.target_resolution:
-				continue
-			cur_res_params.append(getattr(self, layer).conv_parameters())
-		
-		# FromRGB parameters
-		if self.prev_resolution:
-			cur_res_params.append(getattr(self, f'b{self.prev_resolution}').frgb_parameters())
-		cur_res_params.append(getattr(self, f'b{self.target_resolution}').frgb_parameters())
-
-		return chain(*cur_res_params)
-
 #----------------------------------------------------------------------------

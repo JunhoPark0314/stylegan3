@@ -6,12 +6,11 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-"""Generator architecture from the paper
+"""Generator architecture from the paper 
 "Alias-Free Generative Adversarial Networks"."""
 
 from typing import Iterator
 from itertools import chain
-from matplotlib.colors import to_rgb
 from torch.nn.parameter import Parameter
 import numpy as np
 import scipy.signal
@@ -494,8 +493,10 @@ class ToRGBModule(torch.nn.Module):
         self.in_size = np.broadcast_to(np.asarray(in_size), [2])
         self.out_size = np.broadcast_to(np.asarray(out_size), [2])
         self.sampling_rate = sampling_rate
-        self.cutoff = cutoff
-        self.half_width = half_width
+        # self.cutoff = cutoff
+        self.cutoff = out_size / 2
+        # self.half_width = half_width
+        self.half_width = (np.sqrt(2) - 1) * (self.cutoff)
         self.conv_kernel = conv_kernel
         self.conv_clamp = conv_clamp
         self.magnitude_ema_beta = magnitude_ema_beta
@@ -663,7 +664,8 @@ class SynthesisNetwork(torch.nn.Module):
         sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, self.img_resolution)))) # s[i]
         half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
         sizes = sampling_rates + self.margin_size * 2
-        sizes[-2:] = self.img_resolution
+        if self.num_critical > 0:
+            sizes[-self.num_critical:] = self.img_resolution
         channels = np.rint(np.minimum((channel_base * channel_scale / 2) / cutoffs, channel_max * channel_scale))
         
         # Construct layers.
@@ -689,7 +691,7 @@ class SynthesisNetwork(torch.nn.Module):
             setattr(self, name, layer)
             self.layer_names.append(name)
 
-            if int(cutoffs[idx]) >= trg_res // 2 and (trg_res != self.img_resolution):
+            if (trg_res != self.img_resolution) and (int(sampling_rates[idx]) == trg_res) and (int(sampling_rates[idx+1]) != trg_res):
                 cur_res_info = {
                     "in_channels" : int(channels[prev]),
                     "sampling_rate": int(sampling_rates[prev]),
@@ -744,9 +746,9 @@ class SynthesisNetwork(torch.nn.Module):
                 x = (1 - self.alpha) * prev_x + self.alpha * x
                 break
 
-            if self.prev_resolution and getattr(self, name).target_resolution == self.prev_resolution:
+            if self.prev_resolution and (getattr(self, name).target_resolution == self.prev_resolution):
                 prev_x = getattr(self, self.to_rgb_names[self.prev_resolution])(x, w, **layer_kwargs)
-                up_filter = getattr(self, self.to_rgb_names[self.target_resolution]).up_filter
+                up_filter = getattr(self, self.to_rgb_names[self.prev_resolution]).up_filter
                 prev_x = upfirdn2d.upsample2d(prev_x, up_filter, up=2, padding=0, flip_filter=True, gain=1)
 
         if self.output_scale != 1:
@@ -765,6 +767,7 @@ class SynthesisNetwork(torch.nn.Module):
             f'margin_size={self.margin_size:d}, num_fp16_res={self.num_fp16_res:d}'])
 
     def resolution_parameters(self) -> Iterator[Parameter]:
+        return self.parameters()
         # Input parameters
         input_params = self.input.parameters()
 
@@ -1105,6 +1108,7 @@ class Discriminator(torch.nn.Module):
         self.alpha.copy_(torch.zeros([], device=self.alpha.device))
     
     def resolution_parameters(self) -> Iterator[Parameter]:
+        return self.parameters()
         # b4 parameters
         last_params = self.b4.parameters()
 

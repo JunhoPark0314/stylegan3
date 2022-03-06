@@ -19,7 +19,7 @@ D_kwargs:
 
 data:
   resolution: [32, 64, 128, 256, 512]
-  max_batch : 32
+  max_batch : 16
 
 loop_kwargs:
   class_name: 'training.training_loop.ProgressiveTrainer'
