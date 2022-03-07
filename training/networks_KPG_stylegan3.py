@@ -320,7 +320,7 @@ class SynthesisKernel(torch.nn.Module):
 		out_channels,
 		ks,
 		sampling_rate,
-		freq_dim = 128,
+		freq_dim = 24,
 		butterN = 10,
 	):
 		super().__init__()
@@ -329,7 +329,9 @@ class SynthesisKernel(torch.nn.Module):
 		self.ks = ks
 		self.sampling_rate = sampling_rate
 		self.bandlimit = max(sampling_rate) // 2
-		self.freq_dim = freq_dim
+		# self.freq_dim = freq_dim
+		self.freq_dim = freq_dim * len(sampling_rate)
+		# self.freq_dim = min(in_channels, out_channels)
 		
 		# Create uniform distribution on disk
 		radii = (torch.rand(self.freq_dim, 1)) * self.bandlimit
@@ -338,8 +340,9 @@ class SynthesisKernel(torch.nn.Module):
 		phases = torch.rand(self.freq_dim) - 0.5
 		self.register_buffer('freqs', freqs)
 		self.register_buffer('phases', phases)
-		self.in_weight = torch.nn.Parameter(torch.randn([in_channels, freq_dim]))
-		self.out_weight = torch.nn.Parameter(torch.randn([out_channels, freq_dim]))
+		self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, self.freq_dim]))
+		# self.in_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
+		# self.out_weight = torch.nn.Parameter(torch.randn([out_channels, self.freq_dim]))
 		self.butterN = butterN
 		self.gain = np.sqrt(2 / in_channels)
 
@@ -374,7 +377,8 @@ class SynthesisKernel(torch.nn.Module):
 
 		x = x * high_filter * low_filter
 
-		x = torch.einsum('hwc,oc,ic->oihw', x, self.out_weight, self.in_weight) / self.freq_dim
+		# x = torch.einsum('hwc,oc,ic->oihw', x, self.out_weight, self.in_weight) / self.freq_dim
+		x = torch.einsum('hwc,oic->oihw', x, self.weight) / self.freq_dim
 
 		return x * self.gain
 
