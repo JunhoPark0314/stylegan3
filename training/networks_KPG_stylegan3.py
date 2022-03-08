@@ -350,7 +350,6 @@ class SynthesisKernel(torch.nn.Module):
 		bandlimit = None,
 		freq_dim = 32,
 		butterN = 4,
-		rot = False,
 	):
 		super().__init__()
 		self.in_channels = in_channels
@@ -359,14 +358,9 @@ class SynthesisKernel(torch.nn.Module):
 		self.sampling_rate = sampling_rate
 		self.bandlimit = max(sampling_rate) // 2 if bandlimit is None else bandlimit
 		self.freq_dim = freq_dim * len(sampling_rate)
-		self.rot = rot
-		# tr = torch.zeros([self.out_channels, 4])
-		# tr[:,0] = 1
-		tr = torch.randn([self.out_channels, 4])
-		self.tr = torch.nn.Parameter(tr)
 		
 		# Create uniform distribution on disk
-		freqs = torch.randn([self.freq_dim, 2])
+		freqs = torch.randn([self.out_channels,self.freq_dim, 2])
 		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
 		freqs /= radii * radii.square().exp().pow(0.25)
 		freqs *= self.bandlimit
@@ -375,13 +369,11 @@ class SynthesisKernel(torch.nn.Module):
 		# angle = (torch.rand(self.freq_dim, 1) - 0.5) * 2 * np.pi
 		# freqs = torch.cat([radii * angle.sin(), radii * angle.cos()], dim=1)
 
-		phases = (torch.rand(self.freq_dim) - 0.5)
-		_, freq_idx = torch.sort(freqs.norm(dim=-1))
+		phases = (torch.rand([self.out_channels, self.freq_dim]) - 0.5)
 		# self.freqs = torch.nn.Parameter(freqs)
 		# self.phases = torch.nn.Parameter(phases)
 
-		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
-		self.register_buffer('freqs', freqs[freq_idx])
+		self.register_buffer('freqs', freqs)
 		self.register_buffer('phases', phases)
 		# self.in_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
 		# self.out_weight = torch.nn.Parameter(torch.randn([out_channels, self.freq_dim]))
@@ -394,24 +386,8 @@ class SynthesisKernel(torch.nn.Module):
 			alpha = 1
 		# Sample signal
 		sample_size = self.ks
-		freqs = self.freqs.unsqueeze(0)
-		phases = self.phases.unsqueeze(0)
-		transforms = self.transform.unsqueeze(0)
-
-		tr = self.tr / (self.tr[:,:2].norm(dim=1, keepdim=True) + 1e-8)
-		m_r = torch.eye(3, device=transforms.device).unsqueeze(0).repeat([self.out_channels, 1, 1]) # Inverse rotation wrt. resulting image.
-		if self.rot:
-			m_r[:, 0, 0] = tr[:, 0]  # r'_c
-			m_r[:, 0, 1] = -tr[:, 1] # r'_s
-			m_r[:, 1, 0] = tr[:, 1]  # r'_s
-			m_r[:, 1, 1] = tr[:, 0]  # r'_c
-		m_t = torch.eye(3, device=transforms.device).unsqueeze(0).repeat([self.out_channels, 1, 1]) # Inverse rotation wrt. resulting image.
-		m_t[:, 0, 2] = -tr[:, 2] # t'_x
-		m_t[:, 1, 2] = -tr[:, 3] # t'_y
-		transforms = m_r @ m_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
-
-		phases = phases + (freqs @ transforms[:, :2, 2:]).squeeze(2)
-		freqs = freqs @ transforms[:, :2, :2]
+		freqs = self.freqs
+		phases = self.phases
 
 		theta = torch.eye(2, 3, device=device)
 		theta[0, 0] = 0.5 * 3 / target_sampling_rate
