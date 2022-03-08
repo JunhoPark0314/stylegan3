@@ -361,7 +361,7 @@ class SynthesisKernel(torch.nn.Module):
 		
 		# Create uniform distribution on disk
 		freqs = torch.randn([self.out_channels,self.freq_dim, 2])
-		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
+		radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
 		freqs /= radii * radii.square().exp().pow(0.25)
 		freqs *= self.bandlimit
 
