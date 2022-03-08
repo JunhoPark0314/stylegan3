@@ -290,8 +290,8 @@ class BaseTrainer:
         if (self.snap_res != None) and (self.snap_res != self.dataloader.cur_res):
             self.snap_res = self.dataloader.cur_res
             batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-            gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 32)
-            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 32)
+            gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 8)
+            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 14)
             self.grid_size = (gw, gh)
             self.grid_z = torch.cat(self.grid_z)[:gw*gh].split(batch_gpu)
             self.grid_c = torch.cat(self.grid_c)[:gw*gh].split(batch_gpu)
@@ -302,8 +302,8 @@ class BaseTrainer:
             training_set = self.dataloader.cur_trainset
 
             rnd = np.random.RandomState(self.seed)
-            gw = np.clip(1080 // training_set.image_shape[2], 7, 32)
-            gh = np.clip(1920 // training_set.image_shape[1], 4, 32)
+            gw = np.clip(1080 // training_set.image_shape[1], 4, 8)
+            gh = np.clip(1920 // training_set.image_shape[2], 7, 14)
 
             # No labels => show random subset of training samples.
             if not training_set.has_labels:
