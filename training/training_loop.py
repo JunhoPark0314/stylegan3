@@ -302,13 +302,8 @@ class BaseTrainer:
             training_set = self.dataloader.cur_trainset
 
             rnd = np.random.RandomState(self.seed)
-<<<<<<< HEAD
-            gw = np.clip(1080 // training_set.image_shape[1], 4, 8)
-            gh = np.clip(1920 // training_set.image_shape[2], 7, 14)
-=======
             gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 8)
             gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 14)
->>>>>>> a76fb828c6859e55a30f325a0dce7506d6621466
 
             # No labels => show random subset of training samples.
             if not training_set.has_labels:
