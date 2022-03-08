@@ -899,7 +899,7 @@ class DiscriminatorBlock(torch.nn.Module):
             else:
                 a_x = alpha
                 a_y = 1 - alpha
-            x = a_x * x + a_y * y if x is not None else y
+            x = (a_x * x + a_y * y) / np.sqrt(2) if x is not None else y
             img = upfirdn2d.downsample2d(img, self.resample_filter) if (self.architecture == 'skip' or frgb) else None
 
         # Main layers.

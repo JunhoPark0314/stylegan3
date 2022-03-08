@@ -7,7 +7,7 @@ G_kwargs:
   magnitude_ema_beta: 
     inline: 'lambda x : 0.5 ** (x / (20 * 1e3))'
     x: 'batch_size'
-  num_layers: 12
+  num_layers: 14
   num_critical: 2
 
 D_kwargs:

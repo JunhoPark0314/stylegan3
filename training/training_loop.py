@@ -302,8 +302,13 @@ class BaseTrainer:
             training_set = self.dataloader.cur_trainset
 
             rnd = np.random.RandomState(self.seed)
+<<<<<<< HEAD
             gw = np.clip(1080 // training_set.image_shape[1], 4, 8)
             gh = np.clip(1920 // training_set.image_shape[2], 7, 14)
+=======
+            gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 8)
+            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 14)
+>>>>>>> a76fb828c6859e55a30f325a0dce7506d6621466
 
             # No labels => show random subset of training samples.
             if not training_set.has_labels:
@@ -513,7 +518,7 @@ class ProgressiveTrainer(BaseTrainer):
         super().update_per_tick(progress_info)
 
         # change resolution if current nimg is over alpha_kimg
-        if (progress_info.cur_nimg + self.alpha_kimg) // (2 * self.alpha_kimg) > self.alpha_idx and self.alpha_idx < self.max_alpha_idx:
+        if ((progress_info.cur_nimg + self.alpha_kimg) // (2 * self.alpha_kimg) > self.alpha_idx) and (self.alpha_idx < self.max_alpha_idx):
             self.alpha_idx = (progress_info.cur_nimg + self.alpha_kimg) // (2 * self.alpha_kimg)
             self.set_resolution(self.dataloader.cur_res * 2)
 
