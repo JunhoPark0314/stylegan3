@@ -341,6 +341,7 @@ class SynthesisInput(torch.nn.Module):
 			f'sampling_rate={self.sampling_rate:g}, bandwidth={self.bandwidth:g}'])
 
 #----------------------------------------------------------------------------
+
 class SynthesisKernel(torch.nn.Module):
 	def __init__(self,
 		in_channels,
@@ -349,7 +350,7 @@ class SynthesisKernel(torch.nn.Module):
 		sampling_rate,
 		bandlimit = None,
 		freq_dim = 64,
-		butterN = 1,
+		butterN = 2,
 		trainable_f = False,
 	):
 		super().__init__()
@@ -357,8 +358,8 @@ class SynthesisKernel(torch.nn.Module):
 		self.out_channels = out_channels
 		self.ks = ks
 		self.sampling_rate = sampling_rate
-		self.bandlimit = max(sampling_rate) * np.sqrt(2) if bandlimit is None else bandlimit
-		self.freq_dim = freq_dim * len(sampling_rate)
+		self.bandlimit = max(sampling_rate) / np.sqrt(2) if bandlimit is None else bandlimit
+		self.freq_dim = int(self.bandlimit)
 		
 		# Create uniform distribution on disk
 		# freqs = torch.randn([self.freq_dim, 2])
@@ -371,26 +372,162 @@ class SynthesisKernel(torch.nn.Module):
 		# in_freqs = torch.cat([in_radii * in_angle.sin(), in_radii * in_angle.cos()], dim=1)
 		# in_phases = (torch.rand([1,self.freq_dim]) - 0.5)
 
-		out_radii = (torch.rand(self.freq_dim, 1)) * self.bandlimit
-		out_angle = (torch.rand(self.freq_dim, 1) - 0.5) * 2 * np.pi
-		out_freqs = torch.cat([out_radii * out_angle.sin(), out_radii * out_angle.cos()], dim=1)
-		out_phases = (torch.rand([1,self.freq_dim]) - 0.5)
+		self.radii = torch.nn.Parameter((torch.rand(in_channels, self.freq_dim, 1)) * 2)
+		self.angle = torch.nn.Parameter((torch.rand(in_channels, self.freq_dim, 1) - 0.5) * 2 * np.pi)
+		# out_freqs = torch.cat([out_radii * out_angle.sin(), out_radii * out_angle.cos()], dim=1)
+		self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
 
 		# self.register_buffer('in_freqs', in_freqs)
 		# self.register_buffer('in_phases', in_phases)
-		self.register_buffer('out_freqs', out_freqs)
-		self.register_buffer('out_phases', out_phases)
+		# self.register_buffer('out_freqs', out_freqs)
+		# self.register_buffer('out_phases', out_phases)
 
-		self.weight = torch.nn.Parameter(torch.randn([self.in_channels, self.freq_dim]))
-		# self.freq_weight = torch.nn.Parameter(torch.randn([self.freq_dim]))
+		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
+		self.freq_weight = torch.nn.Parameter(torch.randn([self.freq_dim]))
 		self.butterN = butterN
 		self.gain = np.sqrt(1 / (in_channels * (self.ks **2)))
-		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
+		
+		# self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
 
 		# it = torch.randn([in_channels, 2])
 		# self.it = torch.nn.Parameter(it)
-		ot = torch.randn([out_channels, 2])
-		self.ot = torch.nn.Parameter(ot)
+		# ot = torch.randn([out_channels, 2])
+		# self.ot = torch.nn.Parameter(ot)
+
+	def forward(self, target_sampling_rate, device, alpha=None):
+		if alpha == None:
+			alpha = 1
+		# Sample signal
+		sample_size = self.ks
+		# in_freqs = self.in_freqs
+		# in_phases = self.in_phases
+		# it = self.it
+
+		# out_freqs = self.out_freqs
+		# out_phases = self.out_phases
+		# ot = self.ot
+
+		# transforms = self.transform
+
+		# im_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.in_channels, 1, 1) # Inverse rotation wrt. resulting image.
+		# im_t[...,0, 2] = -it[..., 0] # t'_x
+		# im_t[...,1, 2] = -it[..., 1] # t'_y
+		# i_transforms = im_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
+
+		# om_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.out_channels, 1, 1) # Inverse rotation wrt. resulting image.
+		# om_t[...,0, 2] = -ot[..., 0] # t'_x
+		# om_t[...,1, 2] = -ot[..., 1] # t'_y
+		# o_transforms = om_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
+
+		# Transform frequencies.
+		# in_phases = in_phases + (in_freqs @ i_transforms[...,:2, 2:]).squeeze(-1)
+		# out_phases = out_phases + (out_freqs @ o_transforms[...,:2, 2:]).squeeze(-1)
+		# in_freqs = in_freqs.unsqueeze(0).repeat(self.in_channels, 1, 1)
+		# out_freqs = out_freqs.unsqueeze(0).repeat(self.out_channels, 1, 1)
+
+		theta = torch.eye(2, 3, device=device)
+		theta[0, 0] = 0.5 * 3 / (target_sampling_rate)
+		theta[1, 1] = 0.5 * 3 / (target_sampling_rate)
+		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, sample_size, sample_size], align_corners=False)
+		# grids += 0.5 * 3 / (target_sampling_rate * 2 * 4)
+
+		radii = self.radii.sigmoid() * self.bandlimit
+		in_freqs = torch.cat([radii * self.angle.sin(), radii * self.angle.cos()], dim=-1)
+		in_phases = self.phases
+		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs).squeeze(0)
+		ix = ix + in_phases.unsqueeze(1).unsqueeze(2)
+		ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
+
+		# ox = torch.einsum('bhwr,ofr->bohwf', grids, out_freqs).squeeze(0)
+		# ox = ox + out_phases.unsqueeze(1).unsqueeze(2)
+		# ox = torch.sin(ox * (np.pi * 2)) #+ self.freq_bias * 0.1
+
+		#Compute cutoff frequency for butterworth filter based on alpha
+
+		freq_norm = in_freqs.norm(dim=-1)
+		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
+		if target_sampling_rate != min(self.sampling_rate):
+			low_cutoff = target_sampling_rate // 4
+			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
+
+		high_cutoff = alpha * target_sampling_rate//2 + (1 - alpha) * (target_sampling_rate // 4)
+		high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
+		curr_filter = (high_filter * low_filter)
+		ix = ix * curr_filter.unsqueeze(1).unsqueeze(2) * curr_filter.square().mean().rsqrt()
+		# curr_filter = curr_filter * curr_filter.square().mean(dim=-1, keepdim=True).rsqrt()
+		# mag_norm = low_filter[0].sum(dim=-1)/curr_filter[0].sum(dim=-1)
+		# mag_norm = ((curr_filter > 0.1)[0].sum() + 1)
+		# ox = ox * curr_filter.unsqueeze(1).unsqueeze(2)
+		# freq_idx = (curr_filter > 1e-5).nonzero()[:,1]
+
+		# x = x[...,freq_idx] * curr_filter[...,freq_idx]
+		# w = self.weight[...,freq_idx]
+		# w = self.freq_weight
+		# len_freq = self.freq_dim
+		# ik = torch.einsum('ihwf,f->ihw',ix, w) / np.sqrt(len_freq)
+		# ok = torch.einsum('ohwf,f->ohw',ox, w) / np.sqrt(len_freq)
+		# kernel = (ik.unsqueeze(0) + ok.unsqueeze(1)) / 2
+		# kernel = torch.einsum('ihwf,ohwf,f->oihw', ix, ox, w)  / np.sqrt(self.freq_dim * (self.ks **2))
+		# kernel = kernel - torch.std_mean(kernel, dim=[0,1])[1]
+		kernel = torch.einsum('ihwf,f,oi->oihw', ix, self.freq_weight, self.weight) / np.sqrt(self.freq_dim)
+
+		assert torch.isfinite(kernel).all().item()
+		return kernel * self.gain
+
+#----------------------------------------------------------------------------
+class SynthesisGroupKernel(torch.nn.Module):
+	def __init__(self,
+		in_channels,
+		out_channels,
+		ks,
+		sampling_rate,
+		bandlimit = None,
+		freq_dim = 64,
+		butterN = 2,
+		trainable_f = False,
+	):
+		super().__init__()
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+		self.ks = ks
+		self.sampling_rate = sampling_rate
+		self.bandlimit = max(sampling_rate) / np.sqrt(2) if bandlimit is None else bandlimit
+		self.freq_dim = int(self.bandlimit)
+		
+		# Create uniform distribution on disk
+		# freqs = torch.randn([self.freq_dim, 2])
+		# radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
+		# freqs /= radii * radii.square().exp().pow(0.25)
+		# freqs *= self.bandlimit
+
+		# in_radii = (torch.rand(self.freq_dim, 1)) * self.bandlimit
+		# in_angle = (torch.rand(self.freq_dim, 1) - 0.5) * 2 * np.pi
+		# in_freqs = torch.cat([in_radii * in_angle.sin(), in_radii * in_angle.cos()], dim=1)
+		# in_phases = (torch.rand([1,self.freq_dim]) - 0.5)
+
+		self.radii = torch.nn.Parameter((torch.rand(in_channels, self.freq_dim, 1)) * 2)
+		self.angle = torch.nn.Parameter((torch.rand(in_channels, self.freq_dim, 1) - 0.5) * 2 * np.pi)
+		# out_freqs = torch.cat([out_radii * out_angle.sin(), out_radii * out_angle.cos()], dim=1)
+		self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
+
+		# self.register_buffer('in_freqs', in_freqs)
+		# self.register_buffer('in_phases', in_phases)
+		# self.register_buffer('out_freqs', out_freqs)
+		# self.register_buffer('out_phases', out_phases)
+
+		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
+		self.freq_weight = torch.nn.Parameter(torch.randn([self.freq_dim]))
+		self.butterN = butterN
+		self.gain = np.sqrt(1 / (in_channels * (self.ks **2)))
+		
+		# self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
+
+		# it = torch.randn([in_channels, 2])
+		# self.it = torch.nn.Parameter(it)
+		# ot = torch.randn([out_channels, 2])
+		# self.ot = torch.nn.Parameter(ot)
+
+
 		
                 
 
@@ -403,57 +540,61 @@ class SynthesisKernel(torch.nn.Module):
 		# in_phases = self.in_phases
 		# it = self.it
 
-		out_freqs = self.out_freqs
-		out_phases = self.out_phases
-		ot = self.ot
+		# out_freqs = self.out_freqs
+		# out_phases = self.out_phases
+		# ot = self.ot
 
-		transforms = self.transform
+		# transforms = self.transform
 
 		# im_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.in_channels, 1, 1) # Inverse rotation wrt. resulting image.
 		# im_t[...,0, 2] = -it[..., 0] # t'_x
 		# im_t[...,1, 2] = -it[..., 1] # t'_y
 		# i_transforms = im_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
 
-		om_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.out_channels, 1, 1) # Inverse rotation wrt. resulting image.
-		om_t[...,0, 2] = -ot[..., 0] # t'_x
-		om_t[...,1, 2] = -ot[..., 1] # t'_y
-		o_transforms = om_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
+		# om_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.out_channels, 1, 1) # Inverse rotation wrt. resulting image.
+		# om_t[...,0, 2] = -ot[..., 0] # t'_x
+		# om_t[...,1, 2] = -ot[..., 1] # t'_y
+		# o_transforms = om_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
 
 		# Transform frequencies.
 		# in_phases = in_phases + (in_freqs @ i_transforms[...,:2, 2:]).squeeze(-1)
-		out_phases = out_phases + (out_freqs @ o_transforms[...,:2, 2:]).squeeze(-1)
+		# out_phases = out_phases + (out_freqs @ o_transforms[...,:2, 2:]).squeeze(-1)
 		# in_freqs = in_freqs.unsqueeze(0).repeat(self.in_channels, 1, 1)
-		out_freqs = out_freqs.unsqueeze(0).repeat(self.out_channels, 1, 1)
+		# out_freqs = out_freqs.unsqueeze(0).repeat(self.out_channels, 1, 1)
 
 		theta = torch.eye(2, 3, device=device)
-		theta[0, 0] = 0.5 * 3 / (target_sampling_rate * 2)
-		theta[1, 1] = 0.5 * 3 / (target_sampling_rate * 2)
+		theta[0, 0] = 0.5 * 3 / (target_sampling_rate)
+		theta[1, 1] = 0.5 * 3 / (target_sampling_rate)
 		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, sample_size, sample_size], align_corners=False)
-		grids += 0.5 * 3 / (target_sampling_rate * 2 * 4)
+		# grids += 0.5 * 3 / (target_sampling_rate * 2 * 4)
 
-		# ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs).squeeze(0)
-		# ix = ix + in_phases.unsqueeze(1).unsqueeze(2)
-		# ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
+		radii = self.radii.sigmoid() * self.bandlimit
+		in_freqs = torch.cat([radii * self.angle.sin(), radii * self.angle.cos()], dim=-1)
+		in_phases = self.phases
+		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs).squeeze(0)
+		ix = ix + in_phases.unsqueeze(1).unsqueeze(2)
+		ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
 
-		ox = torch.einsum('bhwr,ofr->bohwf', grids, out_freqs).squeeze(0)
-		ox = ox + out_phases.unsqueeze(1).unsqueeze(2)
-		ox = torch.sin(ox * (np.pi * 2)) #+ self.freq_bias * 0.1
+		# ox = torch.einsum('bhwr,ofr->bohwf', grids, out_freqs).squeeze(0)
+		# ox = ox + out_phases.unsqueeze(1).unsqueeze(2)
+		# ox = torch.sin(ox * (np.pi * 2)) #+ self.freq_bias * 0.1
 
 		#Compute cutoff frequency for butterworth filter based on alpha
 
-		freq_norm = out_freqs.norm(dim=-1)
-		low_filter = torch.ones([self.out_channels,self.freq_dim], device=out_freqs.device)
-		low_cutoff = target_sampling_rate // 2
-		low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
+		freq_norm = in_freqs.norm(dim=-1)
+		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
+		if target_sampling_rate != min(self.sampling_rate):
+			low_cutoff = target_sampling_rate // 4
+			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
 
-		high_cutoff = alpha * target_sampling_rate + (1 - alpha) * (target_sampling_rate // 2)
-		high_cutoff = target_sampling_rate//2 
+		high_cutoff = alpha * target_sampling_rate//2 + (1 - alpha) * (target_sampling_rate // 4)
 		high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
-		curr_filter = (high_filter * low_filter).sqrt()
-		curr_filter = curr_filter * curr_filter.square().mean(dim=-1, keepdim=True).rsqrt()
-		mag_norm = low_filter[0].sum(dim=-1)/curr_filter[0].sum(dim=-1)
-		mag_norm = ((curr_filter > 0.1)[0].sum() + 1)
-		ox = ox * curr_filter.unsqueeze(1).unsqueeze(2)
+		curr_filter = (high_filter * low_filter)
+		ix = ix * curr_filter.unsqueeze(1).unsqueeze(2) * curr_filter.square().mean().rsqrt()
+		# curr_filter = curr_filter * curr_filter.square().mean(dim=-1, keepdim=True).rsqrt()
+		# mag_norm = low_filter[0].sum(dim=-1)/curr_filter[0].sum(dim=-1)
+		# mag_norm = ((curr_filter > 0.1)[0].sum() + 1)
+		# ox = ox * curr_filter.unsqueeze(1).unsqueeze(2)
 		# freq_idx = (curr_filter > 1e-5).nonzero()[:,1]
 
 		# x = x[...,freq_idx] * curr_filter[...,freq_idx]
@@ -465,7 +606,7 @@ class SynthesisKernel(torch.nn.Module):
 		# kernel = (ik.unsqueeze(0) + ok.unsqueeze(1)) / 2
 		# kernel = torch.einsum('ihwf,ohwf,f->oihw', ix, ox, w)  / np.sqrt(self.freq_dim * (self.ks **2))
 		# kernel = kernel - torch.std_mean(kernel, dim=[0,1])[1]
-		kernel = torch.einsum('ohwf,if->oihw', ox, self.weight) / np.sqrt(self.freq_dim)
+		kernel = torch.einsum('ihwf,f,oi->oihw', ix, self.freq_weight, self.weight) / np.sqrt(self.freq_dim)
 
 		assert torch.isfinite(kernel).all().item()
 		return kernel * self.gain
