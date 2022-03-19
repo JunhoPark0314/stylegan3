@@ -501,8 +501,8 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.bandlimit = max(sampling_rate) / np.sqrt(2) if bandlimit is None else bandlimit
 		self.freq_dim = int(self.bandlimit)
 		
-		self.radii = torch.nn.Parameter((torch.randn(in_channels, self.freq_dim, 1)))
-		self.angle = torch.nn.Parameter((torch.rand(in_channels, self.freq_dim, 1) - 0.5) * 2 * np.pi)
+		self.radii = torch.nn.Parameter((torch.randn(1, self.freq_dim, 1)))
+		self.angle = torch.nn.Parameter((torch.rand(1, self.freq_dim, 1) - 0.5) * 2 * np.pi)
 		self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
 
 		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
