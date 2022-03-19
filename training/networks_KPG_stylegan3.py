@@ -489,8 +489,9 @@ class SynthesisGroupKernel(torch.nn.Module):
 		sampling_rate,
 		bandlimit = None,
 		freq_dim = 64,
-		butterN = 2,
+		butterN = 3,
 		trainable_f = False,
+		layer_idx = None,
 	):
 		super().__init__()
 		self.in_channels = in_channels
@@ -500,69 +501,23 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.bandlimit = max(sampling_rate) / np.sqrt(2) if bandlimit is None else bandlimit
 		self.freq_dim = int(self.bandlimit)
 		
-		# Create uniform distribution on disk
-		# freqs = torch.randn([self.freq_dim, 2])
-		# radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
-		# freqs /= radii * radii.square().exp().pow(0.25)
-		# freqs *= self.bandlimit
-
-		# in_radii = (torch.rand(self.freq_dim, 1)) * self.bandlimit
-		# in_angle = (torch.rand(self.freq_dim, 1) - 0.5) * 2 * np.pi
-		# in_freqs = torch.cat([in_radii * in_angle.sin(), in_radii * in_angle.cos()], dim=1)
-		# in_phases = (torch.rand([1,self.freq_dim]) - 0.5)
-
-		self.radii = torch.nn.Parameter((torch.rand(in_channels, self.freq_dim, 1)) * 2)
+		self.radii = torch.nn.Parameter((torch.randn(in_channels, self.freq_dim, 1)))
 		self.angle = torch.nn.Parameter((torch.rand(in_channels, self.freq_dim, 1) - 0.5) * 2 * np.pi)
-		# out_freqs = torch.cat([out_radii * out_angle.sin(), out_radii * out_angle.cos()], dim=1)
 		self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
 
-		# self.register_buffer('in_freqs', in_freqs)
-		# self.register_buffer('in_phases', in_phases)
-		# self.register_buffer('out_freqs', out_freqs)
-		# self.register_buffer('out_phases', out_phases)
-
 		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
-		self.freq_weight = torch.nn.Parameter(torch.randn([self.freq_dim]))
+		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
 		self.butterN = butterN
 		self.gain = np.sqrt(1 / (in_channels * (self.ks **2)))
+		self.layer_idx = layer_idx
+
+		# self.test_weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, 3, 3))
 		
-		# self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
-
-		# it = torch.randn([in_channels, 2])
-		# self.it = torch.nn.Parameter(it)
-		# ot = torch.randn([out_channels, 2])
-		# self.ot = torch.nn.Parameter(ot)
-
-	def forward(self, target_sampling_rate, device, alpha=None, update_emas=None):
+	def forward(self, target_sampling_rate, device, alpha=None, update_emas=None, style=False):
 		if alpha == None:
 			alpha = 1
 		# Sample signal
 		sample_size = self.ks
-		in_freqs = self.in_freqs
-		in_phases = self.in_phases
-		# it = self.it
-
-		# out_freqs = self.out_freqs
-		# out_phases = self.out_phases
-		# ot = self.ot
-
-		# transforms = self.transform
-
-		# im_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.in_channels, 1, 1) # Inverse rotation wrt. resulting image.
-		# im_t[...,0, 2] = -it[..., 0] # t'_x
-		# im_t[...,1, 2] = -it[..., 1] # t'_y
-		# i_transforms = im_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
-
-		# om_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.out_channels, 1, 1) # Inverse rotation wrt. resulting image.
-		# om_t[...,0, 2] = -ot[..., 0] # t'_x
-		# om_t[...,1, 2] = -ot[..., 1] # t'_y
-		# o_transforms = om_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
-
-		# Transform frequencies.
-		# in_phases = in_phases + (in_freqs @ i_transforms[...,:2, 2:]).squeeze(-1)
-		# out_phases = out_phases + (out_freqs @ o_transforms[...,:2, 2:]).squeeze(-1)
-		# in_freqs = in_freqs.unsqueeze(0).repeat(self.in_channels, 1, 1)
-		# out_freqs = out_freqs.unsqueeze(0).repeat(self.out_channels, 1, 1)
 
 		theta = torch.eye(2, 3, device=device)
 		theta[0, 0] = 0.5 * 3 / (target_sampling_rate)
@@ -577,42 +532,32 @@ class SynthesisGroupKernel(torch.nn.Module):
 		ix = ix + in_phases.unsqueeze(1).unsqueeze(2)
 		ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
 
-		# ox = torch.einsum('bhwr,ofr->bohwf', grids, out_freqs).squeeze(0)
-		# ox = ox + out_phases.unsqueeze(1).unsqueeze(2)
-		# ox = torch.sin(ox * (np.pi * 2)) #+ self.freq_bias * 0.1
-
 		#Compute cutoff frequency for butterworth filter based on alpha
 
 		freq_norm = in_freqs.norm(dim=-1)
 		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
 		if target_sampling_rate != min(self.sampling_rate):
-			low_cutoff = target_sampling_rate // 4
-			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
+			low_cutoff = alpha * target_sampling_rate//4 + (1 - alpha) * (target_sampling_rate // 8)
+			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * 1))) 
 
 		high_cutoff = alpha * target_sampling_rate//2 + (1 - alpha) * (target_sampling_rate // 4)
 		high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 		curr_filter = (high_filter * low_filter)
 		ix = ix * curr_filter.unsqueeze(1).unsqueeze(2) * curr_filter.square().mean().rsqrt()
-		# curr_filter = curr_filter * curr_filter.square().mean(dim=-1, keepdim=True).rsqrt()
-		# mag_norm = low_filter[0].sum(dim=-1)/curr_filter[0].sum(dim=-1)
-		# mag_norm = ((curr_filter > 0.1)[0].sum() + 1)
-		# ox = ox * curr_filter.unsqueeze(1).unsqueeze(2)
-		# freq_idx = (curr_filter > 1e-5).nonzero()[:,1]
-
-		# x = x[...,freq_idx] * curr_filter[...,freq_idx]
-		# w = self.weight[...,freq_idx]
-		# w = self.freq_weight
-		# len_freq = self.freq_dim
-		# ik = torch.einsum('ihwf,f->ihw',ix, w) / np.sqrt(len_freq)
-		# ok = torch.einsum('ohwf,f->ohw',ox, w) / np.sqrt(len_freq)
-		# kernel = (ik.unsqueeze(0) + ok.unsqueeze(1)) / 2
-		# kernel = torch.einsum('ihwf,ohwf,f->oihw', ix, ox, w)  / np.sqrt(self.freq_dim * (self.ks **2))
-		# kernel = kernel - torch.std_mean(kernel, dim=[0,1])[1]
-		kernel = torch.einsum('ihwf,f,oi->oihw', ix, self.freq_weight, self.weight) / np.sqrt(self.freq_dim)
+		kernel = torch.einsum('ihwf,if,oi->oihw', ix, self.freq_weight, self.weight) * np.sqrt(2 / self.freq_dim)
 
 		assert torch.isfinite(kernel).all().item()
-		# return kernel * self.gain
-		return kernel
+
+		# kernel = self.test_weight
+
+		# if self.layer_idx:
+		# 	save_image(kernel[:3,:32].detach().reshape(3,8,4,3,3).permute(0,1,3,2,4).reshape(3, 24, 12), f'Kernel_{self.layer_idx}_{target_sampling_rate}.png')
+
+		if style:
+			return kernel
+		
+		return kernel * self.gain
+		# return kernel
 	
 #----------------------------------------------------------------------------
 
@@ -895,8 +840,8 @@ class SynthesisLayer(torch.nn.Module):
 		# Path initialization
 		target_sr = sorted(list(set(self.in_sampling_rate.values())))
 		self.target_sr = target_sr
-		self.weight_gen = SynthesisKernel(in_channels=self.in_channels, out_channels=out_channels, 
-										  ks=self.conv_kernel, sampling_rate=self.target_sr)
+		self.weight_gen = SynthesisGroupKernel(in_channels=self.in_channels, out_channels=out_channels, 
+										  ks=self.conv_kernel, sampling_rate=self.target_sr, layer_idx=self.layer_idx)
 		self.init_path()
 		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
 		self.register_buffer('magnitude_ema', torch.ones([]))
@@ -1085,16 +1030,17 @@ class SynthesisLayer(torch.nn.Module):
 			dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
 			curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
+			# curr_alpha = alpha.it
 			# Generate weight given alpha
-			weight = self.weight_gen(alpha=curr_alpha, device=x.device, **path_args.weight_args)
+			weight = self.weight_gen(alpha=curr_alpha, device=x.device, style=True, **path_args.weight_args)
 			# weight = self.test_weight
 
-			path_x[path_args.path] = torch.nn.functional.conv2d(path_x[path_args.path].to(dtype), weight=weight.to(dtype),
-										padding=self.conv_kernel-1, groups=self.in_channels)
+			# path_x[path_args.path] = torch.nn.functional.conv2d(path_x[path_args.path].to(dtype), weight=weight.to(dtype),
+			# 							padding=self.conv_kernel-1, groups=self.in_channels)
 
 			# Execute modulated conv2d.
-			# path_x[path_args.path] = modulated_conv2d(x=path_x[path_args.path].to(dtype), w=weight, s=path_s[path_args.path],
-			# 	padding=self.conv_kernel-1, input_gain=input_gain * curr_alpha) 
+			path_x[path_args.path] = modulated_conv2d(x=path_x[path_args.path].to(dtype), w=weight, s=curr_style,
+				padding=self.conv_kernel-1, input_gain=input_gain * curr_alpha) 
 			# path_x[path_args.path] = simple_conv2d(x=path_x[path_args.path].to(dtype), w=weight,
 			# 	padding=self.conv_kernel-1, input_gain=input_gain * curr_alpha) 
 			alpha_gain.append(curr_alpha ** 2)
@@ -1108,8 +1054,8 @@ class SynthesisLayer(torch.nn.Module):
 			# save_image(path_x[path_args.path][0,:3],f'{resolution}_{self.layer_idx}_{path_args.path}.png') 
 		x = (sum(path_x.values()).to(dtype)) / np.sqrt(sum(alpha_gain))
 
-		x = modulated_conv2d(x=x, w=self.weight, s=curr_style,
-			padding=0, input_gain=input_gain * curr_alpha) 
+		# x = modulated_conv2d(x=x, w=self.weight, s=curr_style,
+		# 	padding=0, input_gain=input_gain * curr_alpha) 
 
 		# Execute bias, filtered leaky ReLU, and clamping.
 		gain = 1 if self.is_torgb else np.sqrt(2)
@@ -1419,9 +1365,9 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.conv_clamp = conv_clamp
 		self.activation = activation
 		self.act_gain = bias_act.activation_funcs[activation].def_gain
-		self.conv0_weight = SynthesisKernel(tmp_channels, tmp_channels, ks=self.kernel_size, sampling_rate=self.sampling_rates_list, trainable_f=False)
+		self.conv0_weight = SynthesisGroupKernel(tmp_channels, tmp_channels, ks=self.kernel_size, sampling_rate=self.sampling_rates_list, trainable_f=False)
 		self.conv0_bias = torch.nn.Parameter(torch.zeros([tmp_channels]))
-		self.conv1_weight = SynthesisKernel(tmp_channels, out_channels, ks=self.kernel_size, sampling_rate=self.sampling_rates_list, trainable_f=False)
+		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, ks=self.kernel_size, sampling_rate=self.sampling_rates_list, trainable_f=False)
 		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
 
 
@@ -1462,6 +1408,7 @@ class DiscriminatorBlock(torch.nn.Module):
 				if res > max_sample_rate:
 					break
 				curr_alpha = alpha.item() if res == resolution else 1
+				# curr_alpha = alpha.item()
 				alpha_gain.append(curr_alpha ** 2)
 				conv0_w[res] = self.conv0_weight(res, x.device, curr_alpha).to(dtype=x.dtype)
 				if max_sample_rate // res > 1:
