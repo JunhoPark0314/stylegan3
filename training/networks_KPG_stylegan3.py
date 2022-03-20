@@ -29,6 +29,49 @@ from torch_utils.ops import upfirdn2d
 #----------------------------------------------------------------------------
 
 @misc.profiled_function
+def modulated_batch_conv2d(
+	x,                  # Input tensor: [batch_size, in_channels, in_height, in_width]
+	w,                  # Weight tensor: [out_channels, in_channels, kernel_height, kernel_width]
+	s,                  # Style tensor: [batch_size, in_channels]
+	demodulate  = True, # Apply weight demodulation?
+	padding     = 0,    # Padding: int or [padH, padW]
+	input_gain  = None, # Optional scale factors for the input channels: [], [in_channels], or [batch_size, in_channels]
+):
+	with misc.suppress_tracer_warnings(): # this value will be treated as a constant
+		batch_size = int(x.shape[0])
+	batch_size, out_channels, in_channels, kh, kw = w.shape
+	misc.assert_shape(w, [batch_size, out_channels, in_channels, kh, kw]) # [OIkk]
+	misc.assert_shape(x, [batch_size, in_channels, None, None]) # [NIHW]
+	misc.assert_shape(s, [batch_size, in_channels]) # [NI]
+
+	# Pre-normalize inputs.
+	if demodulate:
+		w = w * w.square().mean([2,3,4], keepdim=True).rsqrt()
+		s = s * s.square().mean().rsqrt()
+
+	# Modulate weights.
+	# w = w.unsqueeze(0) # [NOIkk]
+	w = w * s.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Demodulate weights.
+	if demodulate:
+		dcoefs = (w.square().sum(dim=[2,3,4]) + 1e-8).rsqrt() # [NO]
+		w = w * dcoefs.unsqueeze(2).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Apply input scaling.
+	if input_gain is not None:
+		input_gain = input_gain.expand(batch_size, in_channels) # [NI]
+		w = w * input_gain.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Execute as one fused op using grouped convolution.
+	x = x.reshape(1, -1, *x.shape[2:])
+	w = w.reshape(-1, in_channels, kh, kw)
+	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=batch_size)
+	x = x.reshape(batch_size, -1, *x.shape[2:])
+	return x
+#----------------------------------------------------------------------------
+
+@misc.profiled_function
 def modulated_conv2d(
 	x,                  # Input tensor: [batch_size, in_channels, in_height, in_width]
 	w,                  # Weight tensor: [out_channels, in_channels, kernel_height, kernel_width]
@@ -492,6 +535,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		butterN = 3,
 		trainable_f = False,
 		layer_idx = None,
+		style_dim = 32,
 	):
 		super().__init__()
 		self.in_channels = in_channels
@@ -501,7 +545,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.bandlimit = max(sampling_rate) / np.sqrt(2) if bandlimit is None else bandlimit
 		self.freq_dim = int(self.bandlimit)
 		
-		self.radii = torch.nn.Parameter((torch.randn(1, self.freq_dim, 1)))
+		self.radii = torch.nn.Parameter((torch.randn(1, self.freq_dim, 1)) * 2)
 		self.angle = torch.nn.Parameter((torch.rand(1, self.freq_dim, 1) - 0.5) * 2 * np.pi)
 		self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
 
@@ -512,12 +556,22 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.layer_idx = layer_idx
 
 		# self.test_weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, 3, 3))
+		# self.affine = torch.nn.Parameter(torch.randn(style_dim, self.freq_dim))
+		self.affine_phase = FullyConnectedLayer(style_dim, self.freq_dim, bias_init=0)
+		self.affine_mag = FullyConnectedLayer(style_dim, self.freq_dim, bias_init=1)
 		
-	def forward(self, target_sampling_rate, device, alpha=None, update_emas=None, style=False):
+	def forward(self, target_sampling_rate, device, alpha=None, update_emas=None, style=None):
 		if alpha == None:
 			alpha = 1
 		# Sample signal
 		sample_size = self.ks
+		radii = self.radii.sigmoid() * self.bandlimit
+		in_freqs = torch.cat([radii * self.angle.sin(), radii * self.angle.cos()], dim=-1)
+		in_phases = self.phases
+
+		if style is not None:
+			it = self.affine_phase(style) * 0.1 # [B, F]
+			in_phases = in_phases.unsqueeze(0) + it.unsqueeze(1)
 
 		theta = torch.eye(2, 3, device=device)
 		theta[0, 0] = 0.5 * 3 / (target_sampling_rate)
@@ -525,11 +579,9 @@ class SynthesisGroupKernel(torch.nn.Module):
 		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, sample_size, sample_size], align_corners=False)
 		# grids += 0.5 * 3 / (target_sampling_rate * 2 * 4)
 
-		radii = self.radii.sigmoid() * self.bandlimit
-		in_freqs = torch.cat([radii * self.angle.sin(), radii * self.angle.cos()], dim=-1)
-		in_phases = self.phases
-		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs).squeeze(0)
-		ix = ix + in_phases.unsqueeze(1).unsqueeze(2)
+
+		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs)
+		ix = ix + in_phases.unsqueeze(2).unsqueeze(3)
 		ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
 
 		#Compute cutoff frequency for butterworth filter based on alpha
@@ -538,13 +590,20 @@ class SynthesisGroupKernel(torch.nn.Module):
 		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
 		if target_sampling_rate != min(self.sampling_rate):
 			low_cutoff = alpha * target_sampling_rate//4 + (1 - alpha) * (target_sampling_rate // 8)
-			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * 1))) 
+			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
 
 		high_cutoff = alpha * target_sampling_rate//2 + (1 - alpha) * (target_sampling_rate // 4)
 		high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 		curr_filter = (high_filter * low_filter)
-		ix = ix * curr_filter.unsqueeze(1).unsqueeze(2) * curr_filter.square().mean().rsqrt()
-		kernel = torch.einsum('ihwf,if,oi->oihw', ix, self.freq_weight, self.weight) * np.sqrt(2 / self.freq_dim)
+		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * curr_filter.square().mean().rsqrt()).unsqueeze(0)
+
+		if style is not None:
+			im = self.affine_mag(style) * 0.1
+			# freq_weight = torch.einsum('bf,if->bif',im,self.freq_weight)
+			freq_weight = self.freq_weight.unsqueeze(0) + im.unsqueeze(1)
+			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
+		else:
+			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
 
 		assert torch.isfinite(kernel).all().item()
 
@@ -553,10 +612,10 @@ class SynthesisGroupKernel(torch.nn.Module):
 		# if self.layer_idx:
 		# 	save_image(kernel[:3,:32].detach().reshape(3,8,4,3,3).permute(0,1,3,2,4).reshape(3, 24, 12), f'Kernel_{self.layer_idx}_{target_sampling_rate}.png')
 
-		if style:
-			return kernel
+		# if style is not None:
+		# 	return kernel
 		
-		return kernel * self.gain
+		return kernel.squeeze(0) * self.gain
 		# return kernel
 	
 #----------------------------------------------------------------------------
@@ -841,7 +900,7 @@ class SynthesisLayer(torch.nn.Module):
 		target_sr = sorted(list(set(self.in_sampling_rate.values())))
 		self.target_sr = target_sr
 		self.weight_gen = SynthesisGroupKernel(in_channels=self.in_channels, out_channels=out_channels, 
-										  ks=self.conv_kernel, sampling_rate=self.target_sr, layer_idx=self.layer_idx)
+										  ks=self.conv_kernel, sampling_rate=self.target_sr, layer_idx=self.layer_idx, style_dim=self.w_dim)
 		self.init_path()
 		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
 		self.register_buffer('magnitude_ema', torch.ones([]))
@@ -1011,6 +1070,7 @@ class SynthesisLayer(torch.nn.Module):
 		path_x = {}
 		path_s = {}
 		curr_style = self.affine(w)
+		alpha_const = 100
 		# skip_x = modulated_conv2d(x=x, w=self.weight, s=curr_style, padding=1, demodulate=(not self.is_torgb), input_gain=input_gain)
 		alpha_gain = []
 		for path_id, path_args in enumerate(self.paths[resolution]):
@@ -1032,18 +1092,18 @@ class SynthesisLayer(torch.nn.Module):
 			curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
 			# curr_alpha = alpha.it
 			# Generate weight given alpha
-			weight = self.weight_gen(alpha=curr_alpha, device=x.device, style=True, **path_args.weight_args)
+			weight = self.weight_gen(alpha=curr_alpha, device=x.device, style=w, **path_args.weight_args)
 			# weight = self.test_weight
 
 			# path_x[path_args.path] = torch.nn.functional.conv2d(path_x[path_args.path].to(dtype), weight=weight.to(dtype),
 			# 							padding=self.conv_kernel-1, groups=self.in_channels)
 
 			# Execute modulated conv2d.
-			path_x[path_args.path] = modulated_conv2d(x=path_x[path_args.path].to(dtype), w=weight, s=curr_style,
-				padding=self.conv_kernel-1, input_gain=input_gain * curr_alpha) 
-			# path_x[path_args.path] = simple_conv2d(x=path_x[path_args.path].to(dtype), w=weight,
-			# 	padding=self.conv_kernel-1, input_gain=input_gain * curr_alpha) 
-			alpha_gain.append(curr_alpha ** 2)
+			# path_x[path_args.path] = modulated_batch_conv2d(x=path_x[path_args.path].to(dtype), w=weight, s=curr_style,
+			# 	padding=self.conv_kernel-1, input_gain=input_gain * np.exp(10 * (curr_alpha - 1))) 
+			path_x[path_args.path] = simple_conv2d(x=path_x[path_args.path].to(dtype), w=weight,
+				padding=self.conv_kernel-1, input_gain=input_gain * np.exp(alpha_const * (curr_alpha - 1))) 
+			alpha_gain.append(np.exp(alpha_const * (curr_alpha - 1)) ** 2)
 			
 			if path_args.up_args:
 				up_filter = getattr(self, path_args.up_filter)
@@ -1058,7 +1118,8 @@ class SynthesisLayer(torch.nn.Module):
 		# 	padding=0, input_gain=input_gain * curr_alpha) 
 
 		# Execute bias, filtered leaky ReLU, and clamping.
-		gain = 1 if self.is_torgb else np.sqrt(2)
+		# gain = 1 if self.is_torgb else np.sqrt(2)
+		gain = 1.1
 		slope = 1 if self.is_torgb else 0.2
 		x = filtered_lrelu.filtered_lrelu(x=x, fu=getattr(self, f'up_filter_{resolution}'), fd=getattr(self, f'down_filter_{resolution}'), 
 			b=self.bias.to(x.dtype), up=self.up_factor[resolution], down=self.down_factor[resolution], padding=self.padding[resolution], 
@@ -1212,7 +1273,7 @@ class SynthesisNetwork(torch.nn.Module):
 
 	def compute_band(self, img_resolution, max_resolution):
 		# Geometric progression of layer cutoffs and min. stopbands.
-		last_cutoff = max_resolution / 2 # f_{c,N}
+		last_cutoff = img_resolution / 2 # f_{c,N}
 		last_stopband = last_cutoff * self.last_stopband_rel # f_{t,N}
 		exponents = np.minimum(np.arange(self.num_layers + 1) / (self.num_layers - self.num_critical), 1)
 		cutoffs = np.minimum(self.first_cutoff * (last_cutoff / self.first_cutoff) ** exponents, img_resolution//2) # f_c[i]
