@@ -12,7 +12,7 @@ import os
 import time
 import copy
 import json
-import pickle
+import dill as pickle
 import psutil
 import PIL.Image
 import numpy as np
@@ -291,7 +291,7 @@ class BaseTrainer:
             self.snap_res = self.dataloader.cur_res
             batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
             gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 8)
-            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 14)
+            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 7)
             self.grid_size = (gw, gh)
             self.grid_z = torch.cat(self.grid_z)[:gw*gh].split(batch_gpu)
             self.grid_c = torch.cat(self.grid_c)[:gw*gh].split(batch_gpu)
@@ -303,7 +303,7 @@ class BaseTrainer:
 
             rnd = np.random.RandomState(self.seed)
             gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 8)
-            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 14)
+            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 7)
 
             # No labels => show random subset of training samples.
             if not training_set.has_labels:
@@ -535,6 +535,7 @@ class ProgressiveTrainer(BaseTrainer):
         cur_alpha = torch.ones([]) * (batch_size / self.alpha_kimg)
         self.G.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
         self.D.alpha.copy_(torch.clip(self.D.alpha + cur_alpha, min=0, max=1))
+        self.G_ema.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
 
 class Logger:
     def __init__(
@@ -697,8 +698,11 @@ class Checkpointer:
 
         # Save image snapshot.
         if (rank == 0) and (self.image_snapshot_ticks is not None) and (done or cur_tick % self.image_snapshot_ticks == 0):
+            # target_resolutions = self.G_ema.target_resolutions
+            # for res in target_resolutions:
+                # self.G_ema.set_resolution(res)
             images = torch.cat([self.G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(self.run_dir, f'fakes{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
+            save_image_grid(images, os.path.join(self.run_dir, f'fakes_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
 
     def save_pkl(
         self, 
@@ -718,7 +722,7 @@ class Checkpointer:
                 if isinstance(value, torch.nn.Module):
                     value = copy.deepcopy(value).eval().requires_grad_(False)
                     if num_gpus > 1:
-                        misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema)')
+                        misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema|alpha)')
                         for param in misc.params_and_buffers(value):
                             torch.distributed.broadcast(param, src=0)
                     snapshot_data[key] = value.cpu()

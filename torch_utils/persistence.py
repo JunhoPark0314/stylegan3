@@ -14,13 +14,14 @@ usable even if the original code is no longer available, or if the current
 version of the code is not consistent with what was originally pickled."""
 
 import sys
-import pickle
+# import pickle
 import io
 import inspect
 import copy
 import uuid
 import types
 import dnnlib
+import dill as pickle
 
 #----------------------------------------------------------------------------
 
