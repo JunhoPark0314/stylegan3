@@ -594,24 +594,24 @@ class SynthesisGroupKernel(torch.nn.Module):
 		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs)
 		ix = ix + in_phases.unsqueeze(2).unsqueeze(3)
 		ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
-		ix *= np.exp(-0.5 * (target_sampling_rate / (16 * 2)) ** 2)
+		ix *= np.exp((min(self.sampling_rate) / target_sampling_rate) ** 2 - 1)
 
 		#Compute cutoff frequency for butterworth filter based on alpha
 
 		freq_norm = in_freqs.norm(dim=-1)
 		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
-		high_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
+		# high_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
 
 		if target_sampling_rate != min(self.sampling_rate):
 			low_cutoff = target_sampling_rate / 2
 			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
-		if max_sampling_rate != None:
-			high_cutoff = max_sampling_rate / 2
-			high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
+		# if max_sampling_rate != None:
+		# 	high_cutoff = max_sampling_rate / 2
+		# 	high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 		
 		max_filter = (1 / (1 + (freq_norm / self.bandlimit) ** (2 * self.butterN)))
 
-		curr_filter = (high_filter * low_filter)
+		curr_filter = (max_filter * low_filter)
 		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * max_filter.square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
 		# ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2)).unsqueeze(0)
 
@@ -621,7 +621,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 			# freq_weight = freq_weight * freq_weight.square().mean(dim=1, keepdim=True).rsqrt()
 			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(2 / self.freq_dim)
 		else:
-			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim) * self.gain
+			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
 
 		assert torch.isfinite(kernel).all().item()
 
@@ -1126,7 +1126,8 @@ class SynthesisLayer(torch.nn.Module):
 
 			dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
-			curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
+			# curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
+			curr_alpha = 1  if (len(self.paths[resolution]) > 1) and (path_id != len(self.paths[resolution]) - 1) else alpha.item()
 			# curr_alpha = 0 if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
 			# curr_alpha = alpha.it
 			# Generate weight given alpha

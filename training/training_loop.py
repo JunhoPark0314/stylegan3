@@ -513,8 +513,8 @@ class ProgressiveTrainer(BaseTrainer):
         super().update_per_tick(progress_info)
 
         # change resolution if current nimg is over alpha_kimg
-        if ((progress_info.cur_nimg + self.alpha_kimg) // (2 * self.alpha_kimg) > self.alpha_idx) and (self.alpha_idx < self.max_alpha_idx):
-            self.alpha_idx = (progress_info.cur_nimg + self.alpha_kimg) // (2 * self.alpha_kimg)
+        if ((progress_info.cur_nimg) // (2 * self.alpha_kimg) > self.alpha_idx) and (self.alpha_idx < self.max_alpha_idx):
+            self.alpha_idx = (progress_info.cur_nimg) // (2 * self.alpha_kimg)
             self.set_resolution(self.dataloader.cur_res * 2)
 
             if progress_info.rank == 0:
