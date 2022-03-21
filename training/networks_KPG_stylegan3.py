@@ -579,7 +579,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		# Sample signal
 		sample_size = self.ks
 		in_freqs = self.freqs
-		in_phases = self.phases.unsqueeze(0) + self.phase_whole.unsqueeze(0)
+		in_phases = (self.phases.unsqueeze(0) + self.phase_whole.unsqueeze(0)) / 2
 		# if style is not None:
 		# 	phase_mod = self.affine_phase(style) * 0.01
 		# 	in_phases = in_phases + phase_mod.unsqueeze(-1)
@@ -1026,6 +1026,7 @@ class SynthesisLayer(torch.nn.Module):
 					max_res = res
 			target_sr_res.append(max_res)
 
+		use_alpha_sr = {sr:True for sr in self.target_sr}
 		for res in target_resolution:
 			cur_res_path = []
 			max_sampling_rate = None
@@ -1083,9 +1084,11 @@ class SynthesisLayer(torch.nn.Module):
 					down_args=down_args,
 					weight_args=weight_args,
 					use_fp16=self.use_fp16[res],
+					use_alpha=use_alpha_sr[sampling_rate]
 				)
 				cur_res_path.append(cur_sample_path)
 				max_sampling_rate = sampling_rate
+				use_alpha_sr[sampling_rate] = False
 
 			paths[res] = cur_res_path
 		self.paths = paths
@@ -1127,7 +1130,9 @@ class SynthesisLayer(torch.nn.Module):
 			dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
 			# curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
-			curr_alpha = 1  if (len(self.paths[resolution]) > 1) and (path_id != len(self.paths[resolution]) - 1) else alpha.item()
+			curr_alpha = alpha.item()  if path_args.use_alpha else 1
+			# if noise_mode == "const":
+			# 	print(self.layer_idx, path_args.path, curr_alpha)
 			# curr_alpha = 0 if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
 			# curr_alpha = alpha.it
 			# Generate weight given alpha
@@ -1151,11 +1156,11 @@ class SynthesisLayer(torch.nn.Module):
 				path_x[path_args.path] = torch.nn.functional.pad(path_x[path_args.path], pad=[pad_size]*4)
 				# t_size = x.shape[-1] + self.conv_kernel - 1
 				# path_x[path_args.path] = torch.nn.functional.interpolate(path_x[path_args.path], mode="bilinear", size=[t_size, t_size])
-
 			# save_image(path_x[path_args.path][0,:3],f'{resolution}_{self.layer_idx}_{path_args.path}.png') 
 		
-		# for k, v in path_x.items():
-		# 	save_image(v[0,:3]*2, f'F{self.layer_idx}_{k}.png')
+		# if noise_mode == 'const':
+		# 	for k, v in path_x.items():
+		# 		save_image(v[0,:3]*2, f'F{self.layer_idx}_{k}.png')
 
 		x = (sum(path_x.values()).to(dtype)) / np.sqrt(sum(alpha_gain))
 
