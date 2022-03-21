@@ -617,11 +617,14 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 		if style is not None:
 			im = self.affine_mag(style)
-			freq_weight = self.freq_weight.unsqueeze(0) * im.unsqueeze(-1)
+			freq_weight = self.freq_weight
+			freq_weight = freq_weight * freq_weight.square().mean(dim=1, keepdim=True).rsqrt()
+			freq_weight = freq_weight.unsqueeze(0) * im.unsqueeze(-1)
+			freq_weight = freq_weight * (freq_weight.square().sum(dim=1, keepdim=True) + 1e-8).rsqrt()
 			# freq_weight = freq_weight * freq_weight.square().mean(dim=1, keepdim=True).rsqrt()
-			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(2 / self.freq_dim)
+			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(1 / (4 * self.freq_dim))
 		else:
-			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
+			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(2 / self.freq_dim) * self.gain
 
 		assert torch.isfinite(kernel).all().item()
 
@@ -631,7 +634,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		# if style is not None:
 		# 	return kernel
 		
-		return kernel.squeeze(0) * self.gain
+		return kernel.squeeze(0)
 		# return kernel
 	
 #----------------------------------------------------------------------------
