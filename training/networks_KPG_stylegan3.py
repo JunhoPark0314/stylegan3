@@ -588,7 +588,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		theta[0, 0] = 0.5 * 3 / (target_sampling_rate)
 		theta[1, 1] = 0.5 * 3 / (target_sampling_rate)
 		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, sample_size, sample_size], align_corners=False)
-		grids -= grids[0,0,0] * 0.5
+		# grids -= grids[0,0,0] * 0.5
 		# grids += 0.5 * 3 / (target_sampling_rate * 2 * 4)
 
 		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs)
@@ -602,18 +602,18 @@ class SynthesisGroupKernel(torch.nn.Module):
 		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
 		high_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
 
-		# if target_sampling_rate != min(self.sampling_rate):
-		# 	low_cutoff = target_sampling_rate / np.sqrt(2)
-		# 	low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
-		# if max_sampling_rate != None:
-		# 	high_cutoff = max_sampling_rate / np.sqrt(2)
-		# 	high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
+		if target_sampling_rate != min(self.sampling_rate):
+			low_cutoff = target_sampling_rate / np.sqrt(2)
+			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
+		if max_sampling_rate != None:
+			high_cutoff = max_sampling_rate / np.sqrt(2)
+			high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 		
 		max_filter = (1 / (1 + (freq_norm / self.bandlimit) ** (2 * self.butterN)))
 
 		curr_filter = (high_filter * low_filter)
-		# ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * max_filter.square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
-		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2)).unsqueeze(0)
+		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * max_filter.square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
+		# ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2)).unsqueeze(0)
 
 		if style is not None:
 			im = self.affine_mag(style)
@@ -955,8 +955,8 @@ class SynthesisLayer(torch.nn.Module):
 		up_factor = int(np.rint(tmp_sampling_rate / in_sampling_rate))
 		assert in_sampling_rate * up_factor == tmp_sampling_rate 
 		up_taps = filter_size * up_factor if up_factor > 1 and not self.is_torgb else 1
-		up_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=up_taps, cutoff=(alpha * prev_in_cutoff + (1 - alpha) * in_cutoff), 
-				width=(alpha * prev_in_half_width + (1 - alpha) * in_half_width)*2, fs=tmp_sampling_rate, device=device)
+		up_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=up_taps, cutoff=((1 - alpha) * prev_in_cutoff + alpha * in_cutoff), 
+				width=((1 - alpha) * prev_in_half_width + alpha * in_half_width)*2, fs=tmp_sampling_rate, device=device)
 
 		# Design downsampling filter.
 		down_factor = int(np.rint(tmp_sampling_rate/ out_sampling_rate))
@@ -964,8 +964,8 @@ class SynthesisLayer(torch.nn.Module):
 		down_taps = filter_size * down_factor if down_factor > 1 and not self.is_torgb else 1
 		down_radial = self.use_radial_filters and not self.is_critically_sampled
 		down_filter = self.design_lowpass_filter(numtaps=down_taps, cutoff=out_cutoff, width=out_half_width*2, fs=tmp_sampling_rate, radial=down_radial)
-		down_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=down_taps, cutoff=(alpha * prev_out_cutoff + (1 - alpha) * out_cutoff), 
-				width=(alpha * prev_out_half_width + (1 - alpha) * out_half_width)*2, fs=tmp_sampling_rate, device=device)
+		down_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=down_taps, cutoff=((1 - alpha) * prev_out_cutoff + alpha * out_cutoff), 
+				width=((1-alpha) * prev_out_half_width + alpha * out_half_width)*2, fs=tmp_sampling_rate, device=device)
 
 		filter_args = {
 			"up_factor": up_factor,
