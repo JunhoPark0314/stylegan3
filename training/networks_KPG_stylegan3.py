@@ -575,7 +575,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		
 	def forward(self, target_sampling_rate, max_sampling_rate, device, update_emas=None, style=None):
 		if max_sampling_rate == None:
-			max_sampling_rate = self.bandlimit * np.sqrt(2)
+			max_sampling_rate = self.bandlimit * 2
 		# Sample signal
 		sample_size = self.ks
 		in_freqs = self.freqs
@@ -603,10 +603,10 @@ class SynthesisGroupKernel(torch.nn.Module):
 		high_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
 
 		if target_sampling_rate != min(self.sampling_rate):
-			low_cutoff = target_sampling_rate / np.sqrt(2)
+			low_cutoff = target_sampling_rate / 2
 			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
 		if max_sampling_rate != None:
-			high_cutoff = max_sampling_rate / np.sqrt(2)
+			high_cutoff = max_sampling_rate / 2
 			high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 		
 		max_filter = (1 / (1 + (freq_norm / self.bandlimit) ** (2 * self.butterN)))
