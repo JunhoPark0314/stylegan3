@@ -559,19 +559,20 @@ class SynthesisGroupKernel(torch.nn.Module):
 		freqs /= radii * radii.square().exp().pow(0.25)
 		freqs *= self.bandlimit
 		self.register_buffer("freqs", freqs)
-		self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
-		self.phase_whole = torch.nn.Parameter((torch.rand([1, self.freq_dim]) -0.5))
+		# self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
+		self.phases = torch.nn.Parameter((torch.randn([in_channels, style_dim])))
 
 		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
-		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
+		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, style_dim]))
 		self.butterN = butterN
 		self.gain = np.sqrt(1 / (in_channels * (self.ks **2)))
 		self.layer_idx = layer_idx
 
 		# self.test_weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, 3, 3))
 		# self.affine = torch.nn.Parameter(torch.randn(style_dim, self.freq_dim))
-		# self.affine_phase = FullyConnectedLayer(style_dim, in_channels, bias_init=0)
-		self.affine_mag = FullyConnectedLayer(style_dim, in_channels, bias_init=1)
+		self.affine_phase = FullyConnectedLayer(style_dim, self.freq_dim, bias_init=0)
+		self.affine_weight = FullyConnectedLayer(style_dim, self.freq_dim)
+		self.affine_mag = FullyConnectedLayer(style_dim, self.freq_dim, bias_init=1)
 		
 	def forward(self, target_sampling_rate, max_sampling_rate, device, update_emas=None, style=None):
 		if max_sampling_rate == None:
@@ -579,9 +580,10 @@ class SynthesisGroupKernel(torch.nn.Module):
 		# Sample signal
 		sample_size = self.ks
 		in_freqs = self.freqs
-		in_phases = self.phases.unsqueeze(0) + self.phase_whole.unsqueeze(0)
+		in_phases = self.affine_phase(self.phases).unsqueeze(0)
+		# in_phases = self.phases.unsqueeze(0) + self.phase_whole.unsqueeze(0)
 		# if style is not None:
-		# 	phase_mod = self.affine_phase(style) * 0.01
+		# 	phase_mod = self.affine_phase(style)
 		# 	in_phases = in_phases + phase_mod.unsqueeze(-1)
 
 		theta = torch.eye(2, 3, device=device)
@@ -614,14 +616,15 @@ class SynthesisGroupKernel(torch.nn.Module):
 		curr_filter = (max_filter * low_filter)
 		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * max_filter.square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
 		# ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2)).unsqueeze(0)
+		freq_weight = self.affine_weight(self.freq_weight)
 
 		if style is not None:
 			im = self.affine_mag(style)
-			freq_weight = self.freq_weight.unsqueeze(0) * im.unsqueeze(-1)
+			freq_weight = freq_weight.unsqueeze(0) * im.unsqueeze(1)
 			# freq_weight = freq_weight * freq_weight.square().mean(dim=1, keepdim=True).rsqrt()
-			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(2 / self.freq_dim)
+			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
 		else:
-			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
+			kernel = torch.einsum('bihwf,if,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
 
 		assert torch.isfinite(kernel).all().item()
 
