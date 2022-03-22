@@ -6,732 +6,1899 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-"""Main training loop."""
+"""Generator architecture from the paper
+"Alias-Free Generative Adversarial Networks"."""
 
-import os
-import time
-import copy
-import json
-import dill as pickle
-import psutil
-import PIL.Image
+from typing import Iterator
+from itertools import chain
+from torch.nn.parameter import Parameter
+from torchvision.utils import save_image
 import numpy as np
+import scipy.signal
+import scipy.optimize
 import torch
 import dnnlib
-from dnnlib.util import EasyDict
-
-from .dataset import MultiResDataLoader
 from torch_utils import misc
-from torch_utils import training_stats
+from torch_utils import persistence
 from torch_utils.ops import conv2d_gradfix
-from torch_utils.ops import grid_sample_gradfix
-
-import legacy
-from metrics import metric_main
-
-#----------------------------------------------------------------------------
-
-def save_image_grid(img, fname, drange, grid_size):
-    lo, hi = drange
-    img = np.asarray(img, dtype=np.float32)
-    img = (img - lo) * (255 / (hi - lo))
-    img = np.rint(img).clip(0, 255).astype(np.uint8)
-
-    gw, gh = grid_size
-    _N, C, H, W = img.shape
-    img = img.reshape([gh, gw, C, H, W])
-    img = img.transpose(0, 3, 1, 4, 2)
-    img = img.reshape([gh * H, gw * W, C])
-
-    assert C in [1, 3]
-    if C == 1:
-        PIL.Image.fromarray(img[:, :, 0], 'L').save(fname)
-    if C == 3:
-        PIL.Image.fromarray(img, 'RGB').save(fname)
+from torch_utils.ops import filtered_lrelu
+from torch_utils.ops import bias_act
+from torch_utils.ops import conv2d_resample
+from torch_utils.ops import upfirdn2d
 
 #----------------------------------------------------------------------------
 
-class BaseTrainer:
-    def __init__(
-        self,
-        rank,
-        cfg,
-        ema_rampup=0.05,
-        ada_kimg=500,
-        image_snapshot_ticks=50,
-        network_snapshot_ticks=50,
-        total_kimg=25000,
-        G_reg_interval=None,
-        D_reg_interval=16,
-        kimg_per_tick=4,
-        ada_interval=4,
-        ada_target=None,
-        progress_fn=None,
-        abort_fn=None,
-    ):
-        self.cfg = cfg
-        # Initialize.
-        self.device = torch.device('cuda', rank)
-        self.seed = cfg.random_seed * cfg.num_gpus + rank
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        torch.backends.cudnn.benchmark = cfg.cudnn_benchmark    # Improves training speed.
-        torch.backends.cuda.matmul.allow_tf32 = False       # Improves numerical accuracy.
-        torch.backends.cudnn.allow_tf32 = False             # Improves numerical accuracy.
-        conv2d_gradfix.enabled = True                       # Improves training speed.
-        grid_sample_gradfix.enabled = True                  # Avoids errors with the augmentation pipe.
-
-        # Initialize with given parameters
-        self.rank = rank
-        self.ema_rampup = ema_rampup
-        self.ada_kimg = ada_kimg
-        self.G_reg_interval = G_reg_interval
-        self.D_reg_interval = D_reg_interval
-        self.kimg_per_tick = kimg_per_tick
-        self.ada_interval = ada_interval
-        self.ada_target = ada_target
-        self.progress_fn = progress_fn
-        self.abort_fn = abort_fn
-
-        # Load training set.
-        if rank == 0:
-            print('Loading training set...')
-
-        self.dataloader = MultiResDataLoader(
-            c = cfg.data,
-            rank = rank,
-            num_gpus = cfg.num_gpus,
-            random_seed = cfg.random_seed,
-            batch_size = cfg.batch_size,
-            use_labels = cfg.use_labels,
-        )
-        
-        if rank == 0:
-            print()
-            print('Num images: ', len(self.dataloader.cur_trainset))
-            print('Image shape:', self.dataloader.cur_trainset.image_shape)
-            print('Label shape:', self.dataloader.cur_trainset.label_shape)
-            print()
-
-        batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-
-        # Construct networks.
-        if rank == 0:
-            print('Constructing networks...')
-
-        common_kwargs = self.get_network_kwargs()
-        self.G = dnnlib.util.construct_class_by_name(**cfg.G_kwargs, **common_kwargs).train().requires_grad_(False).to(self.device) # subclass of torch.nn.Module
-        self.D = dnnlib.util.construct_class_by_name(**cfg.D_kwargs, **common_kwargs).train().requires_grad_(False).to(self.device) # subclass of torch.nn.Module
-        self.G_ema = copy.deepcopy(self.G).eval()
-
-        self.augment_pipe = None
-        self.ada_stats = None
-
-        augment_p = cfg.data.augment_p
-        augment_kwargs = cfg.data.augment_kwargs
-
-        # Setup augmentation.
-        if rank == 0:
-            print('Setting up augmentation...')
-
-        if (augment_kwargs is not None) and (augment_p > 0 or self.ada_target is not None):
-            self.augment_pipe = dnnlib.util.construct_class_by_name(**augment_kwargs).train().requires_grad_(False).to(self.device) # subclass of torch.nn.Module
-            self.augment_pipe.p.copy_(torch.as_tensor(augment_p))
-            if self.ada_target is not None:
-                self.ada_stats = training_stats.Collector(regex='Loss/signs/real')
-
-        self.pg_info  = EasyDict(
-            cur_tick=0,
-            cur_nimg=0,
-            batch_idx=0,
-            tick_start_nimg=0,
-            done=False,
-            num_gpus=cfg.num_gpus,
-            device=self.device,
-            rank=rank,
-            cur_res = self.dataloader.cur_res
-        )
-
-        # Resume from existing pickle.
-        if (cfg.resume_pkl is not None) and (rank == 0):
-            print(f'Resuming from "{cfg.resume_pkl}"')
-            with dnnlib.util.open_url(cfg.resume_pkl) as f:
-                resume_data = legacy.load_network_pkl(f)
-            for name, module in [('G', self.G), ('D', self.D), ('G_ema', self.G_ema), ('augment_pipe', self.augment_pipe)]:
-                misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
-
-            self.pg_info.update(resume_data['progress_info']) 
-            self.dataloader.cur_res = self.pg_info.cur_res
-
-        # Print network summary tables.
-        if rank == 0:
-            z = torch.empty([batch_gpu, self.G.z_dim], device=self.device)
-            c = torch.empty([batch_gpu, self.G.c_dim], device=self.device)
-            img = misc.print_module_summary(self.G, [z, c])
-            misc.print_module_summary(self.D, [img, c])
-
-        # Distribute across GPUs.
-        if rank == 0:
-            print(f'Distributing across {cfg.num_gpus} GPUs...')
-        for module in [self.G, self.D, self.G_ema, self.augment_pipe]:
-            if module is not None and cfg.num_gpus > 1:
-                for param in misc.params_and_buffers(module):
-                    torch.distributed.broadcast(param, src=0)
-
-        # Setup training phases.
-        if rank == 0:
-            print('Setting up training phases...')
-        self.loss = dnnlib.util.construct_class_by_name(device=self.device, G=self.G, D=self.D, augment_pipe=self.augment_pipe, **cfg.loss_kwargs) # subclass of training.loss.Loss
-
-        # Init phase informations. 
-        self.init_phase(cfg)
-
-        # Export sample images.
-        self.snap_res = None
-        if rank == 0:
-            print('Exporting sample images...')
-            grid_size, grid_z, grid_c, images = self.setup_snapshot_image_grid()
-            save_image_grid(images, os.path.join(cfg.run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
-            images = torch.cat([self.G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(cfg.run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
-
-        # Initialize logs.
-        if rank == 0:
-            print('Initializing logs...')
-
-        self.logger = Logger(
-            phases=self.phases, 
-            run_dir=cfg.run_dir, 
-            rank=rank,
-            metrics=cfg.metrics)
-        self.checkpointer = Checkpointer(
-            run_dir=cfg.run_dir,
-            G_ema=self.G_ema,
-            image_snapshot_ticks=image_snapshot_ticks,
-            network_snapshot_ticks=network_snapshot_ticks
-        )
-        self.total_kimg = total_kimg
-    
-    def get_network_kwargs(self):
-        return dict(c_dim=self.dataloader.cur_trainset.label_dim, 
-                    img_resolution=self.dataloader.resolution[-1], 
-                    img_channels=self.dataloader.cur_trainset.num_channels)
-
-    @classmethod
-    def get_params(self, module):
-        return module.parameters()
-    
-    def init_phase(self, cfg):
-        phases = []
-        for idx, (name, module, opt_kwargs, reg_interval) in enumerate([('G', self.G, cfg.G_opt_kwargs, self.G_reg_interval), 
-                                                    ('D', self.D, cfg.D_opt_kwargs, self.D_reg_interval)]):
-            if reg_interval is None:
-                opt = dnnlib.util.construct_class_by_name(params=self.get_params(module), **opt_kwargs) # subclass of torch.optim.Optimizer
-                phases += [dnnlib.EasyDict(name=name+'both', module=module, opt=opt, interval=1)]
-            else: # Lazy regularization.
-                mb_ratio = reg_interval / (reg_interval + 1)
-                opt_kwargs = dnnlib.EasyDict(opt_kwargs)
-                opt_kwargs.lr = opt_kwargs.lr * mb_ratio
-                opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
-                opt = dnnlib.util.construct_class_by_name(self.get_params(module), **opt_kwargs) # subclass of torch.optim.Optimizer
-                phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
-                phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
-            
-            if hasattr(self, 'phases'):
-                phases[-1]['opt'].load_state_dict(self.phases[idx]['opt'].state_dict())
-
-        for phase in phases:
-            phase.start_event = None
-            phase.end_event = None
-            if self.rank == 0:
-                phase.start_event = torch.cuda.Event(enable_timing=True)
-                phase.end_event = torch.cuda.Event(enable_timing=True)
-        
-        self.phases = phases
-    
-    def set_resolution(self, res):
-        # Change parameter set of model for given resolution
-        self.G.set_resolution(res)
-        self.D.set_resolution(res)
-        self.G_ema.set_resolution(res)
-        self.dataloader.set_resolution(res)
-
-        # Re-initialize phases information based on resolution
-        self.init_phase(self.cfg)
-
-    def train(self,):
-        # Train.
-        if self.pg_info.rank == 0:
-            print(f'Training for {self.total_kimg} kimg...')
-            print()
-
-        self.logger.init()
-
-
-        while True:
-            # Loop 1 tick
-            self.loop_one_batch(self.pg_info)
-            self.update_per_batch(self.pg_info)
-
-            if (not self.pg_info.done) and (self.pg_info.cur_tick != 0) and \
-                (self.pg_info.cur_nimg < self.pg_info.tick_start_nimg + self.kimg_per_tick * 1000):
-                continue
-
-            self.update_per_tick(self.pg_info)
-            if self.pg_info.done:
-                break
-
-        # Done.
-        if self.pg_info.rank == 0:
-            print()
-            print('Exiting...')
-
-    def setup_snapshot_image_grid(self):
-        if (self.snap_res != None) and (self.snap_res != self.dataloader.cur_res):
-            self.snap_res = self.dataloader.cur_res
-            batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-            gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 8)
-            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 7)
-            self.grid_size = (gw, gh)
-            self.grid_z = torch.cat(self.grid_z)[:gw*gh].split(batch_gpu)
-            self.grid_c = torch.cat(self.grid_c)[:gw*gh].split(batch_gpu)
-        elif self.snap_res == None:
-            # Real initialize
-            self.snap_res = self.dataloader.cur_res
-            batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-            training_set = self.dataloader.cur_trainset
-
-            rnd = np.random.RandomState(self.seed)
-            gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 8)
-            gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 7)
-
-            # No labels => show random subset of training samples.
-            if not training_set.has_labels:
-                all_indices = list(range(len(training_set)))
-                rnd.shuffle(all_indices)
-                grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
-            else:
-                # Group training samples by label.
-                label_groups = {} # label => [idx, ...]
-                for idx in range(len(training_set)):
-                    label = tuple(training_set.get_details(idx).raw_label.flat[::-1])
-                    if label not in label_groups:
-                        label_groups[label] = []
-                    label_groups[label].append(idx)
-
-                # Reorder.
-                label_order = sorted(label_groups.keys())
-                for label in label_order:
-                    rnd.shuffle(label_groups[label])
-
-                # Organize into grid.
-                grid_indices = []
-                for y in range(gh):
-                    label = label_order[y % len(label_order)]
-                    indices = label_groups[label]
-                    grid_indices += [indices[x % len(indices)] for x in range(gw)]
-                    label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
-
-            # Load data.
-            images, labels = zip(*[training_set[i] for i in grid_indices])
-            self.images = np.stack(images)
-            labels = np.stack(labels)
-            self.grid_z = torch.randn([labels.shape[0], self.G.z_dim], device=self.device).split(batch_gpu)
-            self.grid_c = torch.from_numpy(labels).to(self.device).split(batch_gpu)
-            self.grid_size = (gw, gh)
-
-        return self.grid_size, self.grid_z, self.grid_c, self.images
-
-    def update_per_tick(
-        self,
-        progress_info,
-    ):
-        """
-        progress_info (type : EasyDict)
-            - cur_tick          : Current tick
-            - cur_nimg          : Current number of image trained
-            - batch_idx         : Current batch index
-            - tick_start_nimg   : Number of image trained when tick started
-            - done              : Flag for stop training
-            - num_gpus          : Number of GPUs when multi gpu training
-            - device            : Current device id used in training
-        """
-        # Print status line, accumulating the same information in training_stats.
-
-        self.logger.print_log(progress_info, self.augment_pipe)
-
-        # Check for abort.
-        if (not progress_info.done) and (self.abort_fn is not None) and self.abort_fn():
-            progress_info.done = True
-            if progress_info.rank == 0:
-                print()
-                print('Aborting...')
-
-        grid_size, grid_z, grid_c, _ = self.setup_snapshot_image_grid()
-        self.checkpointer.save_image(progress_info, grid_z, grid_c, grid_size)
-        snap_progress = EasyDict(
-            cur_tick=self.pg_info.cur_tick,
-            cur_nimg=self.pg_info.cur_nimg,
-            batch_idx=self.pg_info.batch_idx,
-            tick_start_nimg=self.pg_info.tick_start_nimg,
-            cur_res=self.pg_info.cur_res,
-        )
-        snapshot_data = dict(G=self.G, D=self.D, G_ema=self.G_ema, augment_pipe=self.augment_pipe, #training_set_kwargs=dict(dataloader.cur_trainset_kwargs))
-                        progress_info=snap_progress)
-        snapshot_pkl, snapshot_data = self.checkpointer.save_pkl(progress_info, snapshot_data)
-
-        self.logger.update_metric(snapshot_pkl, snapshot_data, progress_info)
-
-        if snapshot_data:
-            del snapshot_data # conserve memory
-
-        self.logger.write_log(progress_info)
-
-        if self.progress_fn is not None:
-            self.progress_fn(progress_info.cur_nimg // 1000, self.total_kimg)
-
-        # Update state.
-        progress_info.cur_tick += 1
-        progress_info.tick_start_nimg = progress_info.cur_nimg
-        self.logger.timer.update_start()
-
-    def update_per_batch(
-        self,
-        progress_info,
-    ):
-        """
-        progress_info (type : EasyDict)
-            - cur_tick          : Current tick
-            - cur_nimg          : Current number of image trained
-            - batch_idx         : Current batch index
-            - tick_start_nimg   : Number of image trained when tick started
-            - done              : Flag for stop training
-            - num_gpus          : Number of GPUs when multi gpu training
-            - device            : Current device id used in training
-        """
-        batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-        G = self.G
-        G_ema = self.G_ema
-
-        # Update G_ema.
-        with torch.autograd.profiler.record_function('Gema'):
-            ema_nimg = ema_kimg * 1000
-            if self.ema_rampup is not None:
-                ema_nimg = min(ema_nimg, progress_info.cur_nimg * self.ema_rampup)
-            ema_beta = 0.5 ** (batch_size / max(ema_nimg, 1e-8))
-            for p_ema, p in zip(G_ema.parameters(), G.parameters()):
-                p_ema.copy_(p.lerp(p_ema, ema_beta))
-            for b_ema, b in zip(G_ema.buffers(), G.buffers()):
-                b_ema.copy_(b)
-
-        # Update state.
-        progress_info.cur_nimg += batch_size
-        progress_info.batch_idx += 1
-
-        # Execute ADA heuristic.
-        if (self.ada_stats is not None) and (progress_info.batch_idx % self.ada_interval == 0):
-            self.ada_stats.update()
-            adjust = np.sign(self.ada_stats['Loss/signs/real'] - self.ada_target) * (batch_size * self.ada_interval) / (self.ada_kimg * 1000)
-            self.augment_pipe.p.copy_((self.augment_pipe.p + adjust).max(misc.constant(0, device=progress_info.device)))
-
-        # Perform maintenance tasks once per tick.
-        progress_info.done = (progress_info.cur_nimg >= self.total_kimg * 1000)
-
-    def loop_one_batch(
-        self,
-        progress_info,
-    ):
-        # sourcery skip: simplify-len-comparison, use-fstring-for-concatenation, use-named-expression
-        batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-        z_dim = self.G.z_dim
-        training_set = self.dataloader.cur_trainset
-        training_set_iterator = self.dataloader.cur_iterator
-        loss = self.loss
-        phases = self.phases
-
-        device = progress_info.device
-        batch_idx = progress_info.batch_idx
-        num_gpus = progress_info.num_gpus
-        cur_nimg = progress_info.cur_nimg
-
-        # Fetch training data.
-        with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
-            phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
-            phase_real_c = phase_real_c.to(device).split(batch_gpu)
-            all_gen_z = torch.randn([len(phases) * batch_size, z_dim], device=device)
-            all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
-            all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
-            all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
-            all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
-
-        # Execute training phases.
-        for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
-            if batch_idx % phase.interval != 0:
-                continue
-            if phase.start_event is not None:
-                phase.start_event.record(torch.cuda.current_stream(device))
-
-            # Accumulate gradients.
-            phase.opt.zero_grad(set_to_none=True)
-            phase.module.requires_grad_(True)
-            for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
-            phase.module.requires_grad_(False)
-
-            # Update weights.
-            with torch.autograd.profiler.record_function(phase.name + '_opt'):
-                params = [param for param in phase.module.parameters() if param.grad is not None]
-                if len(params) > 0:
-                    flat = torch.cat([param.grad.flatten() for param in params])
-                    if num_gpus > 1:
-                        torch.distributed.all_reduce(flat)
-                        flat /= num_gpus
-                    misc.nan_to_num(flat, nan=0, posinf=1e5, neginf=-1e5, out=flat)
-                    grads = flat.split([param.numel() for param in params])
-                    for param, grad in zip(params, grads):
-                        param.grad = grad.reshape(param.shape)
-                phase.opt.step()
-
-            # Phase done.
-            if phase.end_event is not None:
-                phase.end_event.record(torch.cuda.current_stream(device))
-
-class ProgressiveTrainer(BaseTrainer):
-    def __init__(self, *args, alpha_kimg, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.alpha_kimg = alpha_kimg
-        self.alpha_idx = 0
-        self.max_alpha_idx = int(np.log2(self.dataloader.resolution[-1] / self.dataloader.resolution[0]))
-
-    def get_network_kwargs(self):
-        return dict(c_dim=self.dataloader.cur_trainset.label_dim, 
-                    target_resolutions=self.dataloader.resolution, 
-                    img_channels=self.dataloader.cur_trainset.num_channels)
-    
-    def update_per_tick(self, progress_info):
-        super().update_per_tick(progress_info)
-
-        # change resolution if current nimg is over alpha_kimg
-        if ((progress_info.cur_nimg) // (2 * self.alpha_kimg) > self.alpha_idx) and (self.alpha_idx < self.max_alpha_idx):
-            self.alpha_idx = (progress_info.cur_nimg) // (2 * self.alpha_kimg)
-            self.set_resolution(self.dataloader.cur_res * 2)
-
-            if progress_info.rank == 0:
-                print(f'Increase target resolution from {self.dataloader.cur_res //2 } to {self.dataloader.cur_res}')
-                batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-                print(f'Batch Size : {batch_size}, Batch per GPU: {batch_gpu}, ema_kimg: {ema_kimg}')
-
-    @classmethod
-    def get_params(self, module):
-        return module.parameters()
-
-    def update_per_batch(
-        self,
-        progress_info,
-    ):
-        super().update_per_batch(progress_info)
-        batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-        cur_alpha = torch.ones([]) * (batch_size / self.alpha_kimg)
-        self.G.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
-        self.D.alpha.copy_(torch.clip(self.D.alpha + cur_alpha, min=0, max=1))
-        self.G_ema.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
-
-class Logger:
-    def __init__(
-        self, 
-        phases,
-        run_dir,
-        rank,
-        metrics,
-    ):
-        self.timer = Timer()
-        self.phases = phases
-        self.run_dir = run_dir
-        self.stats_collector = training_stats.Collector(regex='.*')
-        self.stats_metrics = {}
-        self.stats_jsonl = None
-        self.stats_tfevents = None
-        self.metrics = metrics
-        if rank == 0:
-            self.stats_jsonl = open(os.path.join(self.run_dir, 'stats.jsonl'), 'wt')
-            try:
-                import torch.utils.tensorboard as tensorboard
-                self.stats_tfevents = tensorboard.SummaryWriter(self.run_dir)
-            except ImportError as err:
-                print('Skipping tfevents export:', err)
-    
-    def init(self,):
-        self.timer.init()
-
-    def print_log(
-        self,
-        progress_info,
-        augment_pipe
-    ):
-        cur_tick = progress_info.cur_tick
-        cur_nimg = progress_info.cur_nimg
-        tick_start_nimg = progress_info.tick_start_nimg
-        rank = progress_info.rank
-        device = progress_info.device
-        
-        maintenance_time = self.timer.maintenance_time()
-        self.timer.update_end()
-        fields = []
-        fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
-        fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<8.1f}"]
-        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', self.timer.total_time())):<12s}"]
-        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', self.timer.tick_time()):<7.1f}"]
-        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', self.timer.tick_time() / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
-        fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
-        fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
-        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
-        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
-        torch.cuda.reset_peak_memory_stats()
-        fields += [f"augment {training_stats.report0('Progress/augment', float(augment_pipe.p.cpu()) if augment_pipe is not None else 0):.3f}"]
-        training_stats.report0('Timing/total_hours', self.timer.total_time() / (60 * 60))
-        training_stats.report0('Timing/total_days', self.timer.total_time() / (24 * 60 * 60))
-        if rank == 0:
-            print(' '.join(fields))
-        
-    def update_metric(
-        self,
-        snapshot_pkl,
-        snapshot_data,
-        progress_info
-    ):
-        rank = progress_info.rank
-        num_gpus = progress_info.num_gpus
-        device = progress_info.device
-        
-        if (snapshot_data is not None) and (len(self.metrics) > 0):
-            if rank == 0:
-                print('Evaluating metrics...')
-            for metric in self.metrics:
-                result_dict = metric_main.calc_metric(metric=metric, G=snapshot_data['G_ema'],
-                    dataset_kwargs=self.dataloader.cur_trainset_kwargs, num_gpus=num_gpus, rank=rank, device=device)
-                if rank == 0:
-                    metric_main.report_metric(result_dict, run_dir=self.run_dir, snapshot_pkl=snapshot_pkl)
-                self.stats_metrics.update(result_dict.results)
-    
-    def write_log(self, progress_info):
-        cur_nimg = progress_info.cur_nimg
-        # Collect statistics.
-        for phase in self.phases:
-            value = []
-            if (phase.start_event is not None) and (phase.end_event is not None):
-                phase.end_event.synchronize()
-                value = phase.start_event.elapsed_time(phase.end_event)
-            training_stats.report0('Timing/' + phase.name, value)
-        self.stats_collector.update()
-        stats_dict = self.stats_collector.as_dict()
-
-        # Update logs.
-        timestamp = time.time()
-        if self.stats_jsonl is not None:
-            fields = dict(stats_dict, timestamp=timestamp)
-            self.stats_jsonl.write(json.dumps(fields) + '\n')
-            self.stats_jsonl.flush()
-
-        if self.stats_tfevents is not None:
-            global_step = int(cur_nimg / 1e3)
-            walltime = self.timer.wall_time()
-            for name, value in stats_dict.items():
-                self.stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
-            for name, value in self.stats_metrics.items():
-                self.stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
-            self.stats_tfevents.flush()
-
-class Timer:
-    def __init__(
-        self,
-    ):
-        self.init()
-    
-    def init(self):
-        self.start_time = time.time()
-        self.tick_start_time = time.time()
-        self.tick_end_time = time.time()
-    
-    def update_start(self,):
-        self.tick_start_time = time.time()
-    
-    def update_end(self,):
-        self.tick_end_time = time.time()
-
-    def maintenance_time(self,):
-        return self.tick_start_time - self.tick_end_time
-    
-    def total_time(self,):
-        return self.tick_end_time - self.start_time
-
-    def tick_time(self,):
-        return self.tick_end_time - self.tick_start_time
-    
-    def wall_time(self,):
-        return time.time() - self.start_time
-
-class Checkpointer:
-    def __init__(
-        self,
-        run_dir,
-        G_ema,
-        image_snapshot_ticks,
-        network_snapshot_ticks,
-    ):
-        self.image_snapshot_ticks = image_snapshot_ticks
-        self.network_snapshot_ticks = network_snapshot_ticks
-        self.run_dir = run_dir
-        self.G_ema = G_ema
-
-    def save_image(
-        self, 
-        progress_info,
-        grid_z,
-        grid_c,
-        grid_size,
-    ):
-        done = progress_info.done
-        cur_nimg = progress_info.cur_nimg
-        cur_tick = progress_info.cur_tick
-        rank = progress_info.rank
-
-        # Save image snapshot.
-        if (rank == 0) and (self.image_snapshot_ticks is not None) and (done or cur_tick % self.image_snapshot_ticks == 0):
-            # target_resolutions = self.G_ema.target_resolutions
-            # for res in target_resolutions:
-                # self.G_ema.set_resolution(res)
-            images = torch.cat([self.G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-            save_image_grid(images, os.path.join(self.run_dir, f'fakes_{cur_nimg//1000:06d}.png'), drange=[-1,1], grid_size=grid_size)
-
-    def save_pkl(
-        self, 
-        progress_info,
-        snapshot_data
-    ):
-        done = progress_info.done
-        cur_nimg = progress_info.cur_nimg
-        cur_tick = progress_info.cur_tick
-        num_gpus = progress_info.num_gpus
-        rank = progress_info.rank
-
-        # Save network snapshot.
-        snapshot_pkl = None
-        if (self.network_snapshot_ticks is not None) and (done or cur_tick % self.network_snapshot_ticks == 0):
-            for key, value in snapshot_data.items():
-                if isinstance(value, torch.nn.Module):
-                    value = copy.deepcopy(value).eval().requires_grad_(False)
-                    if num_gpus > 1:
-                        misc.check_ddp_consistency(value, ignore_regex=r'.*\.[^.]+_(avg|ema|alpha)')
-                        for param in misc.params_and_buffers(value):
-                            torch.distributed.broadcast(param, src=0)
-                    snapshot_data[key] = value.cpu()
-                del value # conserve memory
-            snapshot_pkl = os.path.join(self.run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
-            if rank == 0:
-                with open(snapshot_pkl, 'wb') as f:
-                    pickle.dump(snapshot_data, f)
-        else:
-            snapshot_data=None
-        
-        return snapshot_pkl, snapshot_data
+@misc.profiled_function
+def modulated_batch_conv2d(
+	x,                  # Input tensor: [batch_size, in_channels, in_height, in_width]
+	w,                  # Weight tensor: [out_channels, in_channels, kernel_height, kernel_width]
+	s,                  # Style tensor: [batch_size, in_channels]
+	demodulate  = True, # Apply weight demodulation?
+	padding     = 0,    # Padding: int or [padH, padW]
+	input_gain  = None, # Optional scale factors for the input channels: [], [in_channels], or [batch_size, in_channels]
+):
+	with misc.suppress_tracer_warnings(): # this value will be treated as a constant
+		batch_size = int(x.shape[0])
+	batch_size, out_channels, in_channels, kh, kw = w.shape
+	misc.assert_shape(w, [batch_size, out_channels, in_channels, kh, kw]) # [OIkk]
+	misc.assert_shape(x, [batch_size, in_channels, None, None]) # [NIHW]
+	misc.assert_shape(s, [batch_size, in_channels]) # [NI]
+
+	# Pre-normalize inputs.
+	if demodulate:
+		w = w * w.square().mean([2,3,4], keepdim=True).rsqrt()
+		s = s * s.square().mean().rsqrt()
+
+	# Modulate weights.
+	# w = w.unsqueeze(0) # [NOIkk]
+	w = w * s.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Demodulate weights.
+	if demodulate:
+		dcoefs = (w.square().sum(dim=[2,3,4]) + 1e-8).rsqrt() # [NO]
+		w = w * dcoefs.unsqueeze(2).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Apply input scaling.
+	if input_gain is not None:
+		input_gain = input_gain.expand(batch_size, in_channels) # [NI]
+		w = w * input_gain.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Execute as one fused op using grouped convolution.
+	x = x.reshape(1, -1, *x.shape[2:])
+	w = w.reshape(-1, in_channels, kh, kw)
+	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=batch_size)
+	x = x.reshape(batch_size, -1, *x.shape[2:])
+	return x
+#----------------------------------------------------------------------------
+
+@misc.profiled_function
+def modulated_conv2d(
+	x,                  # Input tensor: [batch_size, in_channels, in_height, in_width]
+	w,                  # Weight tensor: [out_channels, in_channels, kernel_height, kernel_width]
+	s,                  # Style tensor: [batch_size, in_channels]
+	demodulate  = True, # Apply weight demodulation?
+	padding     = 0,    # Padding: int or [padH, padW]
+	input_gain  = None, # Optional scale factors for the input channels: [], [in_channels], or [batch_size, in_channels]
+):
+	with misc.suppress_tracer_warnings(): # this value will be treated as a constant
+		batch_size = int(x.shape[0])
+	out_channels, in_channels, kh, kw = w.shape
+	misc.assert_shape(w, [out_channels, in_channels, kh, kw]) # [OIkk]
+	misc.assert_shape(x, [batch_size, in_channels, None, None]) # [NIHW]
+	misc.assert_shape(s, [batch_size, in_channels]) # [NI]
+
+	# Pre-normalize inputs.
+	if demodulate:
+		w = w * w.square().mean([1,2,3], keepdim=True).rsqrt()
+		s = s * s.square().mean().rsqrt()
+
+	# Modulate weights.
+	w = w.unsqueeze(0) # [NOIkk]
+	w = w * s.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Demodulate weights.
+	if demodulate:
+		dcoefs = (w.square().sum(dim=[2,3,4]) + 1e-8).rsqrt() # [NO]
+		w = w * dcoefs.unsqueeze(2).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Apply input scaling.
+	if input_gain is not None:
+		input_gain = input_gain.expand(batch_size, in_channels) # [NI]
+		w = w * input_gain.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Execute as one fused op using grouped convolution.
+	x = x.reshape(1, -1, *x.shape[2:])
+	w = w.reshape(-1, in_channels, kh, kw)
+	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=batch_size)
+	x = x.reshape(batch_size, -1, *x.shape[2:])
+	return x
+
+#----------------------------------------------------------------------------
+
+@misc.profiled_function
+def simple_conv2d(
+	x,                  # Input tensor: [batch_size, in_channels, in_height, in_width]
+	w,                  # Weight tensor: [out_channels, in_channels, kernel_height, kernel_width]
+	padding     = 0,    # Padding: int or [padH, padW]
+	input_gain  = None, # Optional scale factors for the input channels: [], [in_channels], or [batch_size, in_channels]
+):
+	with misc.suppress_tracer_warnings(): # this value will be treated as a constant
+		batch_size = int(x.shape[0])
+	_, out_channels, in_channels, kh, kw = w.shape
+	misc.assert_shape(w, [batch_size, out_channels, in_channels, kh, kw]) # [OIkk]
+	misc.assert_shape(x, [batch_size, in_channels, None, None]) # [NIHW]
+
+	# Apply input scaling.
+	if input_gain is not None:
+		input_gain = input_gain.expand(batch_size, in_channels) # [NI]
+		w = w * input_gain.unsqueeze(1).unsqueeze(3).unsqueeze(4) # [NOIkk]
+
+	# Execute as one fused op using grouped convolution.
+	x = x.reshape(1, -1, *x.shape[2:])
+	w = w.reshape(-1, in_channels, kh, kw)
+	x = conv2d_gradfix.conv2d(input=x, weight=w.to(x.dtype), padding=padding, groups=batch_size)
+	x = x.reshape(batch_size, -1, *x.shape[2:])
+	return x
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class FullyConnectedLayer(torch.nn.Module):
+	def __init__(self,
+		in_features,                # Number of input features.
+		out_features,               # Number of output features.
+		activation      = 'linear', # Activation function: 'relu', 'lrelu', etc.
+		bias            = True,     # Apply additive bias before the activation function?
+		lr_multiplier   = 1,        # Learning rate multiplier.
+		weight_init     = 1,        # Initial standard deviation of the weight tensor.
+		bias_init       = 0,        # Initial value of the additive bias.
+	):
+		super().__init__()
+		self.in_features = in_features
+		self.out_features = out_features
+		self.activation = activation
+		self.weight = torch.nn.Parameter(torch.randn([out_features, in_features]) * (weight_init / lr_multiplier))
+		bias_init = np.broadcast_to(np.asarray(bias_init, dtype=np.float32), [out_features])
+		self.bias = torch.nn.Parameter(torch.from_numpy(bias_init / lr_multiplier)) if bias else None
+		self.weight_gain = lr_multiplier / np.sqrt(in_features)
+		self.bias_gain = lr_multiplier
+
+	def forward(self, x):
+		w = self.weight.to(x.dtype) * self.weight_gain
+		b = self.bias
+		if b is not None:
+			b = b.to(x.dtype)
+			if self.bias_gain != 1:
+				b = b * self.bias_gain
+		if self.activation == 'linear' and b is not None:
+			x = torch.addmm(b.unsqueeze(0), x, w.t())
+		else:
+			x = x.matmul(w.t())
+			x = bias_act.bias_act(x, b, act=self.activation)
+		return x
+
+	def extra_repr(self):
+		return f'in_features={self.in_features:d}, out_features={self.out_features:d}, activation={self.activation:s}'
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class Conv2dLayer(torch.nn.Module):
+	def __init__(self,
+		in_channels,                    # Number of input channels.
+		out_channels,                   # Number of output channels.
+		kernel_size,                    # Width and height of the convolution kernel.
+		bias            = True,         # Apply additive bias before the activation function?
+		activation      = 'linear',     # Activation function: 'relu', 'lrelu', etc.
+		up              = 1,            # Integer upsampling factor.
+		down            = 1,            # Integer downsampling factor.
+		resample_filter = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
+		conv_clamp      = None,         # Clamp the output to +-X, None = disable clamping.
+		channels_last   = False,        # Expect the input to have memory_format=channels_last?
+		trainable       = True,         # Update the weights of this layer during training?
+	):
+		super().__init__()
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+		self.activation = activation
+		self.up = up
+		self.down = down
+		self.conv_clamp = conv_clamp
+		self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
+		self.padding = kernel_size // 2
+		self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
+		self.act_gain = bias_act.activation_funcs[activation].def_gain
+
+		memory_format = torch.channels_last if channels_last else torch.contiguous_format
+		weight = torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format)
+		bias = torch.zeros([out_channels]) if bias else None
+		if trainable:
+			self.weight = torch.nn.Parameter(weight)
+			self.bias = torch.nn.Parameter(bias) if bias is not None else None
+		else:
+			self.register_buffer('weight', weight)
+			if bias is not None:
+				self.register_buffer('bias', bias)
+			else:
+				self.bias = None
+
+	def forward(self, x, gain=1, down=None):
+		curr_down = down if down != None else self.down
+		w = self.weight * self.weight_gain
+		b = self.bias.to(x.dtype) if self.bias is not None else None
+		flip_weight = (self.up == 1) # slightly faster
+		x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=curr_down, padding=self.padding, flip_weight=flip_weight)
+
+		act_gain = self.act_gain * gain
+		act_clamp = self.conv_clamp * gain if self.conv_clamp is not None else None
+		x = bias_act.bias_act(x, b, act=self.activation, gain=act_gain, clamp=act_clamp)
+		return x
+
+	def extra_repr(self):
+		return ' '.join([
+			f'in_channels={self.in_channels:d}, out_channels={self.out_channels:d}, activation={self.activation:s},',
+			f'up={self.up}, down={self.down}'])
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class MappingNetwork(torch.nn.Module):
+	def __init__(self,
+		z_dim,                      # Input latent (Z) dimensionality.
+		c_dim,                      # Conditioning label (C) dimensionality, 0 = no labels.
+		w_dim,                      # Intermediate latent (W) dimensionality.
+		num_ws,                     # Number of intermediate latents to output.
+		num_layers      = 2,        # Number of mapping layers.
+		lr_multiplier   = 0.01,     # Learning rate multiplier for the mapping layers.
+		w_avg_beta      = 0.998,    # Decay for tracking the moving average of W during training.
+	):
+		super().__init__()
+		self.z_dim = z_dim
+		self.c_dim = c_dim
+		self.w_dim = w_dim
+		self.num_ws = num_ws
+		self.num_layers = num_layers
+		self.w_avg_beta = w_avg_beta
+
+		# Construct layers.
+		self.embed = FullyConnectedLayer(self.c_dim, self.w_dim) if self.c_dim > 0 else None
+		features = [self.z_dim + (self.w_dim if self.c_dim > 0 else 0)] + [self.w_dim] * self.num_layers
+		for idx, in_features, out_features in zip(range(num_layers), features[:-1], features[1:]):
+			layer = FullyConnectedLayer(in_features, out_features, activation='lrelu', lr_multiplier=lr_multiplier)
+			setattr(self, f'fc{idx}', layer)
+		self.register_buffer('w_avg', torch.zeros([w_dim]))
+
+	def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False):
+		misc.assert_shape(z, [None, self.z_dim])
+		if truncation_cutoff is None:
+			truncation_cutoff = self.num_ws
+
+		# Embed, normalize, and concatenate inputs.
+		x = z.to(torch.float32)
+		x = x * (x.square().mean(1, keepdim=True) + 1e-8).rsqrt()
+		if self.c_dim > 0:
+			misc.assert_shape(c, [None, self.c_dim])
+			y = self.embed(c.to(torch.float32))
+			y = y * (y.square().mean(1, keepdim=True) + 1e-8).rsqrt()
+			x = torch.cat([x, y], dim=1) if x is not None else y
+
+		# Execute layers.
+		for idx in range(self.num_layers):
+			x = getattr(self, f'fc{idx}')(x)
+
+		# Update moving average of W.
+		if update_emas:
+			self.w_avg.copy_(x.detach().mean(dim=0).lerp(self.w_avg, self.w_avg_beta))
+
+		# Broadcast and apply truncation.
+		x = x.unsqueeze(1).repeat([1, self.num_ws, 1])
+		if truncation_psi != 1:
+			x[:, :truncation_cutoff] = self.w_avg.lerp(x[:, :truncation_cutoff], truncation_psi)
+		return x
+
+	def extra_repr(self):
+		return f'z_dim={self.z_dim:d}, c_dim={self.c_dim:d}, w_dim={self.w_dim:d}, num_ws={self.num_ws:d}'
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class SynthesisInput(torch.nn.Module):
+	def __init__(self,
+		w_dim,          # Intermediate latent (W) dimensionality.
+		channels,       # Number of output channels.
+		size,           # Output spatial size: int or [width, height].
+		sampling_rate,  # Output sampling rate.
+		bandwidth,      # Output bandwidth.
+	):
+		super().__init__()
+		self.w_dim = w_dim
+		self.channels = channels
+		# self.size = np.broadcast_to(np.asarray(size), [2])
+		self.size = size
+		self.sampling_rate = sampling_rate
+		self.bandwidth = bandwidth
+
+		# Draw random frequencies from uniform 2D disc.
+		freqs = torch.randn([self.channels, 2])
+		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
+		freqs /= radii * radii.square().exp().pow(0.25)
+		freqs *= bandwidth
+		phases = torch.rand([self.channels]) - 0.5
+
+		# Setup parameters and buffers.
+		self.weight = torch.nn.Parameter(torch.randn([self.channels, self.channels]))
+		self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
+		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
+		self.register_buffer('freqs', freqs)
+		self.register_buffer('phases', phases)
+
+	def forward(self, w, resolution):
+		# Introduce batch dimension.
+		transforms = self.transform.unsqueeze(0) # [batch, row, col]
+		freqs = self.freqs.unsqueeze(0) # [batch, channel, xy]
+		phases = self.phases.unsqueeze(0) # [batch, channel]
+		size = self.size[resolution]
+
+		# Apply learned transformation.
+		t = self.affine(w) # t = (r_c, r_s, t_x, t_y)
+		t = t / t[:, :2].norm(dim=1, keepdim=True) # t' = (r'_c, r'_s, t'_x, t'_y)
+		m_r = torch.eye(3, device=w.device).unsqueeze(0).repeat([w.shape[0], 1, 1]) # Inverse rotation wrt. resulting image.
+		m_r[:, 0, 0] = t[:, 0]  # r'_c
+		m_r[:, 0, 1] = -t[:, 1] # r'_s
+		m_r[:, 1, 0] = t[:, 1]  # r'_s
+		m_r[:, 1, 1] = t[:, 0]  # r'_c
+		m_t = torch.eye(3, device=w.device).unsqueeze(0).repeat([w.shape[0], 1, 1]) # Inverse translation wrt. resulting image.
+		m_t[:, 0, 2] = -t[:, 2] # t'_x
+		m_t[:, 1, 2] = -t[:, 3] # t'_y
+		transforms = m_r @ m_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
+
+		# Transform frequencies.
+		phases = phases + (freqs @ transforms[:, :2, 2:]).squeeze(2)
+		freqs = freqs @ transforms[:, :2, :2]
+
+		# Dampen out-of-band frequencies that may occur due to the user-specified transform.
+		amplitudes = (1 - (freqs.norm(dim=2) - self.bandwidth) / (self.sampling_rate / 2 - self.bandwidth)).clamp(0, 1)
+
+		# Construct sampling grid.
+		theta = torch.eye(2, 3, device=w.device)
+		# theta[0, 0] = 0.5 * self.size[0] / self.sampling_rate
+		# theta[1, 1] = 0.5 * self.size[1] / self.sampling_rate
+		theta[0, 0] = 0.5 * size / self.sampling_rate
+		theta[1, 1] = 0.5 * size / self.sampling_rate
+		# grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, self.size[1], self.size[0]], align_corners=False)
+		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, size, size], align_corners=False)
+
+		# Compute Fourier features.
+		x = (grids.unsqueeze(3) @ freqs.permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]
+		x = x + phases.unsqueeze(1).unsqueeze(2)
+		x_var = x.square().mean(dim=[0,3], keepdim=True)
+		x = torch.sin(x * (np.pi * 2)) * (-0.5 * x_var).exp()
+		x = x * amplitudes.unsqueeze(1).unsqueeze(2)
+
+		# Apply trainable mapping.
+		weight = self.weight / np.sqrt(self.channels)
+		x = x @ weight.t()
+
+		# Ensure correct shape.
+		x = x.permute(0, 3, 1, 2) # [batch, channel, height, width]
+		# misc.assert_shape(x, [w.shape[0], self.channels, int(self.size[1]), int(self.size[0])])
+		misc.assert_shape(x, [w.shape[0], self.channels, int(size), int(size)])
+		return x
+
+	def extra_repr(self):
+		return '\n'.join([
+			f'w_dim={self.w_dim:d}, channels={self.channels:d}, size={list(self.size)},',
+			f'sampling_rate={self.sampling_rate:g}, bandwidth={self.bandwidth:g}'])
+
+#----------------------------------------------------------------------------
+
+class SynthesisKernel(torch.nn.Module):
+	def __init__(self,
+		in_channels,
+		out_channels,
+		ks,
+		sampling_rate,
+		bandlimit = None,
+		freq_dim = 64,
+		butterN = 2,
+		trainable_f = False,
+	):
+		super().__init__()
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+		self.ks = ks
+		self.sampling_rate = sampling_rate
+		self.bandlimit = max(sampling_rate) / np.sqrt(2) if bandlimit is None else bandlimit
+		self.freq_dim = int(self.bandlimit)
+		
+		# Create uniform distribution on disk
+		# freqs = torch.randn([self.freq_dim, 2])
+		# radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
+		# freqs /= radii * radii.square().exp().pow(0.25)
+		# freqs *= self.bandlimit
+
+		# in_radii = (torch.rand(self.freq_dim*self.freq_dim, 1)) * self.bandlimit
+		# in_angle = (torch.rand(self.freq_dim*self.freq_dim, 1) - 0.5) * 2 * np.pi
+		# in_freqs = torch.cat([in_radii * in_angle.sin(), in_radii * in_angle.cos()], dim=-1)
+		in_freqs = torch.randn([self.freq_dim, 2])
+		in_phases = (torch.rand([self.in_channels, self.freq_dim*self.freq_dim]) - 0.5)
+
+		# out_radii = (torch.rand(self.freq_dim, 1)) * self.bandlimit
+		# out_angle = (torch.rand(self.freq_dim, 1) - 0.5) * 2 * np.pi
+		# out_freqs = torch.cat([out_radii * out_angle.sin(), out_radii * out_angle.cos()], dim=1)
+		# out_phases = (torch.rand([1,self.freq_dim]) - 0.5)
+
+		# self.register_buffer('in_freqs', in_freqs)
+		self.in_freqs = torch.nn.Parameter(in_freqs * 3)
+		self.in_phases = torch.nn.Parameter(in_phases)
+		# self.register_buffer('in_phases', in_phases)
+		# self.in_phases = torch.nn.Parameter(in_phases)
+		# self.register_buffer('out_freqs', out_freqs)
+		# self.register_buffer('out_phases', out_phases)
+
+		self.in_weight = torch.nn.Parameter(torch.rand([self.in_channels, self.freq_dim*self.freq_dim]))
+		# self.out_weight = torch.nn.Parameter(torch.randn([self.out_channels, self.freq_dim]))
+		# self.freq_weight = torch.nn.Parameter(torch.randn([self.freq_dim]))
+		# self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, self.freq_dim]))
+		self.butterN = butterN
+		self.gain = np.sqrt(1 / (in_channels * (self.ks **2)))
+		
+		# self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
+
+		# it = torch.randn([in_channels, 2])
+		# self.it = torch.nn.Parameter(it)
+		# ot = torch.randn([out_channels, 2])
+		# self.ot = torch.nn.Parameter(ot)
+
+	def forward(self, target_sampling_rate, device, alpha=None):
+		if alpha == None:
+			alpha = 1
+		# Sample signal
+		sample_size = self.ks
+		# in_freqs = self.in_freqs
+		# in_phases = self.in_phases
+		# it = self.it
+
+		# out_freqs = self.out_freqs
+		# out_phases = self.out_phases
+		# ot = self.ot
+
+		# transforms = self.transform
+
+		# im_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.in_channels, 1, 1) # Inverse rotation wrt. resulting image.
+		# im_t[...,0, 2] = -it[..., 0] # t'_x
+		# im_t[...,1, 2] = -it[..., 1] # t'_y
+		# i_transforms = im_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
+
+		# om_t = torch.eye(3, device=device).unsqueeze(0).repeat(self.out_channels, 1, 1) # Inverse rotation wrt. resulting image.
+		# om_t[...,0, 2] = -ot[..., 0] # t'_x
+		# om_t[...,1, 2] = -ot[..., 1] # t'_y
+		# o_transforms = om_t @ transforms # First rotate resulting image, then translate, and finally apply user-specified transform.
+
+		# Transform frequencies.
+		# in_phases = in_phases + (in_freqs @ i_transforms[...,:2, 2:]).squeeze(-1)
+		# out_phases = out_phases + (out_freqs @ o_transforms[...,:2, 2:]).squeeze(-1)
+		# in_freqs = in_freqs.unsqueeze(0).repeat(self.in_channels, 1, 1)
+		# out_freqs = out_freqs.unsqueeze(0).repeat(self.out_channels, 1, 1)
+
+		theta = torch.eye(2, 3, device=device)
+		theta[0, 0] = 0.5 * 3 / (target_sampling_rate)
+		theta[1, 1] = 0.5 * 3 / (target_sampling_rate)
+		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, sample_size, sample_size], align_corners=False)
+		# grids += 0.5 * 3 / (target_sampling_rate * 2 * 4)
+
+		radii = self.radii.sigmoid() * self.bandlimit
+		in_freqs = torch.cat([radii * self.angle.sin(), radii * self.angle.cos()], dim=-1)
+		in_phases = self.phases
+		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs).squeeze(0)
+		ix = ix + in_phases.unsqueeze(1).unsqueeze(2)
+		ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
+
+		# ox = torch.einsum('bhwr,ofr->bohwf', grids, out_freqs).squeeze(0)
+		# ox = ox + out_phases.unsqueeze(1).unsqueeze(2)
+		# ox = torch.sin(ox * (np.pi * 2)) #+ self.freq_bias * 0.1
+
+		#Compute cutoff frequency for butterworth filter based on alpha
+
+		freq_norm = in_freqs.norm(dim=-1)
+		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
+		if target_sampling_rate != min(self.sampling_rate):
+			low_cutoff = target_sampling_rate // 4
+			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
+
+		high_cutoff = alpha * target_sampling_rate//2 + (1 - alpha) * (target_sampling_rate // 4)
+		high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
+		curr_filter = (high_filter * low_filter)
+		ix = ix * curr_filter.unsqueeze(1).unsqueeze(2) * curr_filter.square().mean().rsqrt()
+		# curr_filter = curr_filter * curr_filter.square().mean(dim=-1, keepdim=True).rsqrt()
+		# mag_norm = low_filter[0].sum(dim=-1)/curr_filter[0].sum(dim=-1)
+		# mag_norm = ((curr_filter > 0.1)[0].sum() + 1)
+		# ox = ox * curr_filter.unsqueeze(1).unsqueeze(2)
+		# freq_idx = (curr_filter > 1e-5).nonzero()[:,1]
+
+		# x = x[...,freq_idx] * curr_filter[...,freq_idx]
+		# w = self.weight[...,freq_idx]
+		# w = self.freq_weight
+		# len_freq = self.freq_dim
+		# ik = torch.einsum('ihwf,f->ihw',ix, w) / np.sqrt(len_freq)
+		# ok = torch.einsum('ohwf,f->ohw',ox, w) / np.sqrt(len_freq)
+		# kernel = (ik.unsqueeze(0) + ok.unsqueeze(1)) / 2
+		# kernel = torch.einsum('ihwf,ohwf,f->oihw', ix, ox, w)  / np.sqrt(self.freq_dim * (self.ks **2))
+		# kernel = kernel - torch.std_mean(kernel, dim=[0,1])[1]
+		kernel = torch.einsum('ihwf,f,oi->oihw', ix, self.freq_weight, self.weight) / np.sqrt(self.freq_dim)
+
+		assert torch.isfinite(kernel).all().item()
+		return kernel * self.gain
+
+#----------------------------------------------------------------------------
+class SynthesisGroupKernel(torch.nn.Module):
+	def __init__(self,
+		in_channels,
+		out_channels,
+		ks,
+		sampling_rate,
+		bandlimit = None,
+		freq_dim = 64,
+		butterN = 1,
+		trainable_f = False,
+		layer_idx = None,
+		style_dim = 32,
+	):
+		super().__init__()
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+		self.ks = ks
+		self.sampling_rate = sampling_rate
+		self.bandlimit = max(sampling_rate) * np.sqrt(2) if bandlimit is None else bandlimit
+		self.freq_dim = max(int(self.bandlimit), freq_dim)
+		
+		# radii = torch.randn(1, self.freq_dim, 1) * self.bandlimit
+		# angle = (torch.rand(1, self.freq_dim, 1) - 0.5) * 2 * np.pi
+		# freqs = torch.cat([radii * angle.sin(), radii * angle.cos()], dim=-1)
+		freqs = torch.randn([1, self.freq_dim, 2])
+		radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
+		freqs /= radii * radii.square().exp().pow(0.25)
+		freqs *= self.bandlimit
+		self.register_buffer("freqs", freqs)
+		self.phases = torch.nn.Parameter((torch.rand([in_channels, self.freq_dim]) - 0.5))
+		self.phase_whole = torch.nn.Parameter((torch.rand([1, self.freq_dim]) -0.5))
+
+		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
+		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
+		self.butterN = butterN
+		self.gain = np.sqrt(1 / (in_channels * (self.ks **2)))
+		self.layer_idx = layer_idx
+
+		# self.test_weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, 3, 3))
+		# self.affine = torch.nn.Parameter(torch.randn(style_dim, self.freq_dim))
+		# self.affine_phase = FullyConnectedLayer(style_dim, in_channels, bias_init=0)
+		self.affine_mag = FullyConnectedLayer(style_dim, in_channels, bias_init=1)
+		
+	def forward(self, target_sampling_rate, max_sampling_rate, device, update_emas=None, style=None):
+		if max_sampling_rate == None:
+			max_sampling_rate = self.bandlimit
+		# Sample signal
+		sample_size = self.ks
+		in_freqs = self.freqs
+		in_phases = (self.phases.unsqueeze(0) + self.phase_whole.unsqueeze(0)) / 2
+		# if style is not None:
+		# 	phase_mod = self.affine_phase(style) * 0.01
+		# 	in_phases = in_phases + phase_mod.unsqueeze(-1)
+
+		theta = torch.eye(2, 3, device=device)
+		theta[0, 0] = 0.5 * 3 / (target_sampling_rate)
+		theta[1, 1] = 0.5 * 3 / (target_sampling_rate)
+		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, sample_size, sample_size], align_corners=False)
+		grids -= grids[0,0,0] * 0.5
+		# grids += 0.5 * 3 / (target_sampling_rate * 2 * 4)
+
+		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs)
+		ix = ix + in_phases.unsqueeze(2).unsqueeze(3)
+		ix_var = ix.square().mean(dim=[0,1], keepdim=True)
+		ix = torch.sin(ix * (np.pi * 2)) * ((-0.5) * ix_var).exp() #+ self.freq_bias * 0.1
+		# ix *= np.exp((min(self.sampling_rate) / target_sampling_rate) ** 2 - 1)
+
+		#Compute cutoff frequency for butterworth filter based on alpha
+
+		freq_norm = in_freqs.norm(dim=-1)
+		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
+		high_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
+
+		if target_sampling_rate != min(self.sampling_rate):
+			low_cutoff = target_sampling_rate
+			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
+
+		# high_cutoff = max_sampling_rate
+		# high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
+		
+		max_filter = (1 / (1 + (freq_norm / self.bandlimit) ** (2 * self.butterN)))
+
+		curr_filter = (high_filter * low_filter)
+		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * max_filter.square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
+		# ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2)).unsqueeze(0)
+
+		if style is not None:
+			im = self.affine_mag(style)
+			freq_weight = self.freq_weight.unsqueeze(0) * im.unsqueeze(-1)
+			# freq_weight = freq_weight * freq_weight.square().mean(dim=1, keepdim=True).rsqrt()
+			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(2 / self.freq_dim)
+		else:
+			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
+
+		assert torch.isfinite(kernel).all().item()
+
+		# if self.layer_idx:
+		# 	save_image(kernel[:3,:32].detach().reshape(3,8,4,3,3).permute(0,1,3,2,4).reshape(3, 24, 12), f'Kernel_{self.layer_idx}_{target_sampling_rate}.png')
+
+		# if style is not None:
+		# 	return kernel
+		
+		return kernel.squeeze(0) * self.gain
+		# return kernel
+	
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class ToRGBLayer(torch.nn.Module):
+	def __init__(self,
+		# General specifications.
+		w_dim,                          # Intermediate latent (W) dimensionality.
+		is_torgb,                       # Is this the final ToRGB layer?
+		is_critically_sampled,          # Does this layer use critical sampling?
+		in_channels,                    # Number of input channels.
+		out_channels,                   # Number of output channels.
+		target_resolutions,             # Target resolution list.
+
+		# Per resolution specifications.
+		use_fp16,                       # Does this layer use FP16?
+		in_size,                        # Input spatial size: int or [width, height].
+		out_size,                       # Output spatial size: int or [width, height].
+		in_sampling_rate,               # Input sampling rate (s).
+		out_sampling_rate,              # Output sampling rate (s).
+		in_cutoff,                      # Input cutoff frequency (f_c).
+		out_cutoff,                     # Output cutoff frequency (f_c).
+		in_half_width,                  # Input transition band half-width (f_h).
+		out_half_width,                 # Output Transition band half-width (f_h).
+
+		# Hyperparameters.
+		conv_kernel         = 3,        # Convolution kernel size. Ignored for final the ToRGB layer.
+		filter_size         = 6,        # Low-pass filter size relative to the lower resolution when up/downsampling.
+		lrelu_upsampling    = 2,        # Relative sampling rate for leaky ReLU. Ignored for final the ToRGB layer.
+		use_radial_filters  = False,    # Use radially symmetric downsampling filter? Ignored for critically sampled layers.
+		conv_clamp          = 256,      # Clamp the output to [-X, +X], None = disable clamping.
+		magnitude_ema_beta  = 0.999,    # Decay rate for the moving average of input magnitudes.
+	):
+		super().__init__()
+		self.w_dim = w_dim
+		self.is_torgb = is_torgb
+		self.is_critically_sampled = is_critically_sampled
+		self.use_fp16 = use_fp16
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+		# self.in_size = np.broadcast_to(np.asarray(in_size), [2])
+		# self.out_size = np.broadcast_to(np.asarray(out_size), [2])
+		self.in_size = in_size
+		self.out_size = out_size
+		self.in_sampling_rate = in_sampling_rate
+		self.out_sampling_rate = out_sampling_rate
+		# self.tmp_sampling_rate = max(in_sampling_rate, out_sampling_rate) * (1 if is_torgb else lrelu_upsampling)
+		self.in_cutoff = in_cutoff
+		self.out_cutoff = out_cutoff
+		self.in_half_width = in_half_width
+		self.out_half_width = out_half_width
+		self.conv_kernel = 1 if is_torgb else conv_kernel
+		self.conv_clamp = conv_clamp
+		self.magnitude_ema_beta = magnitude_ema_beta
+
+		# Alias filter initialization
+		self.filter_size = filter_size
+		self.lrelu_upsampling = lrelu_upsampling
+		self.use_radial_filters = use_radial_filters
+		
+		self.padding = {}
+		self.up_factor = {}
+		self.down_factor = {}
+		for res in target_resolutions:
+			up_filter, down_filter, filter_args = self.get_filter(
+				in_sampling_rate=in_sampling_rate[res], out_sampling_rate=out_sampling_rate[res],
+				in_cutoff=in_cutoff[res], out_cutoff=out_cutoff[res],
+				in_half_width=in_half_width[res], out_half_width=out_half_width[res], tmp_rate=(1 if self.is_torgb else self.lrelu_upsampling))
+			padding = self.get_down_padding(in_size=in_size[res], out_size=out_size[res], **filter_args)
+			self.register_buffer(f'up_filter_{res}', up_filter)
+			self.register_buffer(f'down_filter_{res}', down_filter)
+			self.padding[res] = padding
+			self.up_factor[res] = filter_args['up_factor']
+			self.down_factor[res] = filter_args['down_factor']
+
+		self.affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=1)
+		self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, self.conv_kernel, self.conv_kernel])) 
+		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
+		self.register_buffer('magnitude_ema', torch.ones([]))
+
+		
+	def get_filter(self, 
+		in_sampling_rate, 
+		out_sampling_rate, 
+		in_cutoff,
+		out_cutoff,
+		in_half_width,
+		out_half_width,
+		tmp_rate,
+		filter_size = None,
+	):
+		tmp_sampling_rate = max(in_sampling_rate, out_sampling_rate) * tmp_rate
+		filter_size = filter_size if filter_size is not None else self.filter_size
+
+		# Design upsampling filter.
+		up_factor = int(np.rint(tmp_sampling_rate / in_sampling_rate))
+		assert in_sampling_rate * up_factor == tmp_sampling_rate
+		up_taps = filter_size * up_factor if up_factor > 1 and not self.is_torgb else 1
+		up_filter = self.design_lowpass_filter(numtaps=up_taps, cutoff=in_cutoff, width=in_half_width*2, fs=tmp_sampling_rate)
+
+		# Design downsampling filter.
+		down_factor = int(np.rint(tmp_sampling_rate / out_sampling_rate))
+		assert out_sampling_rate * down_factor == tmp_sampling_rate
+		down_taps = filter_size * down_factor if down_factor > 1 and not self.is_torgb else 1
+		down_radial = self.use_radial_filters and not self.is_critically_sampled
+		down_filter = self.design_lowpass_filter(numtaps=down_taps, cutoff=out_cutoff, width=out_half_width*2, fs=tmp_sampling_rate, radial=down_radial)
+
+		filter_args = {
+			"up_factor": up_factor,
+			"down_factor": down_factor,
+			"up_taps": up_taps,
+			"down_taps": down_taps,
+		}
+
+		return up_filter, down_filter, filter_args
+	
+	def get_down_padding(self,
+		in_size,
+		out_size,
+		up_factor,
+		down_factor,
+		up_taps,
+		down_taps,
+	):
+		# Compute padding.
+		pad_total = (out_size - 1) * down_factor + 1 # Desired output size before downsampling.
+		pad_total -= (in_size + self.conv_kernel - 1) * up_factor # Input size after upsampling.
+		pad_total += up_taps + down_taps - 2 # Size reduction caused by the filters.
+		pad_lo = (pad_total + up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
+		pad_hi = pad_total - pad_lo
+		padding = [int(pad_lo), int(pad_hi), int(pad_lo), int(pad_hi)]
+		return padding
+
+	def forward(self, x, w, resolution=None, alpha=None, noise_mode='random', force_fp32=False, update_emas=False):
+		assert noise_mode in ['random', 'const', 'none'] # unused
+		assert (resolution is not None) and (alpha is not None)
+		misc.assert_shape(x, [None, self.in_channels, int(self.in_size[resolution]), int(self.in_size[resolution])])
+		misc.assert_shape(w, [x.shape[0], self.w_dim])
+
+		# Track input magnitude.
+		if update_emas:
+			with torch.autograd.profiler.record_function('update_magnitude_ema'):
+				magnitude_cur = x.detach().to(torch.float32).square().mean()
+				self.magnitude_ema.copy_(magnitude_cur.lerp(self.magnitude_ema, self.magnitude_ema_beta))
+		input_gain = self.magnitude_ema.rsqrt()
+
+		# Execute affine layer.
+		styles = self.affine(w)
+		if self.is_torgb:
+			weight_gain = 1 / np.sqrt(self.in_channels * (self.conv_kernel ** 2))
+			styles = styles * weight_gain
+
+		# Execute modulated conv2d.
+		dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+		x = modulated_conv2d(x=x.to(dtype), w=self.weight, s=styles,
+			padding=self.conv_kernel-1, demodulate=(not self.is_torgb), input_gain=input_gain)
+		
+		# Execute bias, filtered leaky ReLU, and clamping.
+		gain = 1 if self.is_torgb else np.sqrt(2)
+		slope = 1 if self.is_torgb else 0.2
+		x = filtered_lrelu.filtered_lrelu(x=x, fu=getattr(self, f'up_filter_{resolution}'), fd=getattr(self, f'down_filter_{resolution}'), 
+			b=self.bias.to(x.dtype), up=self.up_factor[resolution], down=self.down_factor[resolution], padding=self.padding[resolution], 
+			gain=gain, slope=slope, clamp=self.conv_clamp)
+
+		# Ensure correct shape and dtype.
+		misc.assert_shape(x, [None, self.out_channels, int(self.out_size[resolution]), int(self.out_size[resolution])])
+		assert x.dtype == dtype
+		return x
+
+	@staticmethod
+	def design_lowpass_filter(numtaps, cutoff, width, fs, radial=False):
+		assert numtaps >= 1
+
+		# Identity filter.
+		if numtaps == 1:
+			return None
+
+		# Separable Kaiser low-pass filter.
+		if not radial:
+			f = scipy.signal.firwin(numtaps=numtaps, cutoff=cutoff, width=width, fs=fs)
+			return torch.as_tensor(f, dtype=torch.float32)
+
+		# Radially symmetric jinc-based filter.
+		x = (np.arange(numtaps) - (numtaps - 1) / 2) / fs
+		r = np.hypot(*np.meshgrid(x, x))
+		f = scipy.special.j1(2 * cutoff * (np.pi * r)) / (np.pi * r)
+		beta = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs / 2)))
+		w = np.kaiser(numtaps, beta)
+		f *= np.outer(w, w)
+		f /= np.sum(f)
+		return torch.as_tensor(f, dtype=torch.float32)
+
+	def extra_repr(self):
+		return '\n'.join([
+			f'w_dim={self.w_dim:d}, is_torgb={self.is_torgb},',
+			f'is_critically_sampled={self.is_critically_sampled}, use_fp16={self.use_fp16},',
+			f'in_sampling_rate={self.in_sampling_rate:g}, out_sampling_rate={self.out_sampling_rate:g},',
+			f'in_cutoff={self.in_cutoff:g}, out_cutoff={self.out_cutoff:g},',
+			f'in_half_width={self.in_half_width:g}, out_half_width={self.out_half_width:g},',
+			f'in_size={list(self.in_size)}, out_size={list(self.out_size)},',
+			f'in_channels={self.in_channels:d}, out_channels={self.out_channels:d}'])
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class SynthesisLayer(torch.nn.Module):
+	def __init__(self,
+		# General specifications.
+		w_dim,                          # Intermediate latent (W) dimensionality.
+		is_torgb,                       # Is this the final ToRGB layer?
+		is_critically_sampled,          # Does this layer use critical sampling?
+		in_channels,                    # Number of input channels.
+		out_channels,                   # Number of output channels.
+		target_resolutions,             # Target resolution list.
+
+		# Per resolution specifications.
+		use_fp16,                       # Does this layer use FP16?
+		in_size,                        # Input spatial size: int or [width, height].
+		out_size,                       # Output spatial size: int or [width, height].
+		in_sampling_rate,               # Input sampling rate (s).
+		out_sampling_rate,              # Output sampling rate (s).
+		in_cutoff,                      # Input cutoff frequency (f_c).
+		out_cutoff,                     # Output cutoff frequency (f_c).
+		in_half_width,                  # Input transition band half-width (f_h).
+		out_half_width,                 # Output Transition band half-width (f_h).
+
+		# Hyperparameters.
+		conv_kernel         = 3,        # Convolution kernel size. Ignored for final the ToRGB layer.
+		filter_size         = 6,        # Low-pass filter size relative to the lower resolution when up/downsampling.
+		lrelu_upsampling    = 2,        # Relative sampling rate for leaky ReLU. Ignored for final the ToRGB layer.
+		use_radial_filters  = False,    # Use radially symmetric downsampling filter? Ignored for critically sampled layers.
+		conv_clamp          = 256,      # Clamp the output to [-X, +X], None = disable clamping.
+		magnitude_ema_beta  = 0.999,    # Decay rate for the moving average of input magnitudes.
+		layer_idx			= 0,		# For Debug
+	):
+		super().__init__()
+		self.w_dim = w_dim
+		self.is_torgb = is_torgb
+		self.is_critically_sampled = is_critically_sampled
+		self.use_fp16 = use_fp16
+		self.in_channels = in_channels
+		self.out_channels = out_channels
+		# self.in_size = np.broadcast_to(np.asarray(in_size), [2])
+		# self.out_size = np.broadcast_to(np.asarray(out_size), [2])
+		self.in_size = in_size
+		self.out_size = out_size
+		self.in_sampling_rate = in_sampling_rate
+		self.out_sampling_rate = out_sampling_rate
+		# self.tmp_sampling_rate = max(in_sampling_rate, out_sampling_rate) * (1 if is_torgb else lrelu_upsampling)
+		self.in_cutoff = in_cutoff
+		self.out_cutoff = out_cutoff
+		self.in_half_width = in_half_width
+		self.out_half_width = out_half_width
+		self.conv_kernel = 1 if is_torgb else conv_kernel
+		self.conv_clamp = conv_clamp
+		self.magnitude_ema_beta = magnitude_ema_beta
+
+		self.layer_idx = layer_idx
+
+		# Alias filter initialization
+		self.filter_size = filter_size
+		self.lrelu_upsampling = lrelu_upsampling
+		self.use_radial_filters = use_radial_filters
+		
+		self.padding = {}
+		self.up_factor = {}
+		self.down_factor = {}
+		min_res = min(target_resolutions)
+		prev_in_cutoff, prev_out_cutoff, prev_in_half_wdith, prev_out_half_width = \
+			in_cutoff[min_res], out_cutoff[min_res], in_half_width[min_res], out_half_width[min_res]
+		for res in target_resolutions:
+			up_filter, down_filter, filter_args = self.get_filter(
+				in_sampling_rate=in_sampling_rate[res], out_sampling_rate=out_sampling_rate[res],
+				in_cutoff=in_cutoff[res], out_cutoff=out_cutoff[res],
+				prev_in_cutoff=prev_in_cutoff, prev_out_cutoff=prev_out_cutoff,
+				prev_in_half_width=prev_in_half_wdith, prev_out_half_width=prev_out_half_width,
+				in_half_width=in_half_width[res], out_half_width=out_half_width[res], tmp_rate=(1 if self.is_torgb else self.lrelu_upsampling))
+
+			prev_in_cutoff, prev_out_cutoff, prev_in_half_wdith, prev_out_half_width = \
+				in_cutoff[res], out_cutoff[res], in_half_width[res], out_half_width[res]
+			padding = self.get_down_padding(in_size=in_size[res], out_size=out_size[res], **filter_args)
+			# self.register_buffer(f'up_filter_{res}', up_filter)
+			# self.register_buffer(f'down_filter_{res}', down_filter)
+			setattr(self, f'up_filter_{res}', up_filter)
+			setattr(self, f'down_filter_{res}', down_filter)
+			self.padding[res] = padding
+			self.up_factor[res] = filter_args['up_factor']
+			self.down_factor[res] = filter_args['down_factor']
+
+		# Path initialization
+		target_sr = sorted(list(set(self.in_sampling_rate.values())))
+		self.target_sr = target_sr
+		self.weight_gen = SynthesisGroupKernel(in_channels=self.in_channels, out_channels=out_channels, 
+										  ks=self.conv_kernel, sampling_rate=self.target_sr, layer_idx=self.layer_idx, style_dim=self.w_dim)
+		self.init_path()
+		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
+		self.register_buffer('magnitude_ema', torch.ones([]))
+		self.test_weight = torch.nn.Parameter(torch.randn([self.in_channels, 1, 3, 3]))
+		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, 1, 1]))
+		self.affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=1)
+		
+	def get_filter(self, 
+		in_sampling_rate, 
+		out_sampling_rate, 
+		in_cutoff,
+		out_cutoff,
+		in_half_width,
+		out_half_width,
+		prev_in_cutoff,
+		prev_out_cutoff,
+		prev_in_half_width,
+		prev_out_half_width,
+		tmp_rate,
+		filter_size = None,
+	):
+		tmp_sampling_rate= max(in_sampling_rate, out_sampling_rate) * tmp_rate
+		filter_size = filter_size if filter_size is not None else self.filter_size
+
+		# Design upsampling filter.
+		up_factor = int(np.rint(tmp_sampling_rate / in_sampling_rate))
+		assert in_sampling_rate * up_factor == tmp_sampling_rate 
+		up_taps = filter_size * up_factor if up_factor > 1 and not self.is_torgb else 1
+		up_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=up_taps, cutoff=((1 - alpha) * prev_in_cutoff + alpha * in_cutoff), 
+				width=((1 - alpha) * prev_in_half_width + alpha * in_half_width)*2, fs=tmp_sampling_rate, device=device)
+
+		# Design downsampling filter.
+		down_factor = int(np.rint(tmp_sampling_rate/ out_sampling_rate))
+		assert out_sampling_rate * down_factor == tmp_sampling_rate 
+		down_taps = filter_size * down_factor if down_factor > 1 and not self.is_torgb else 1
+		down_radial = self.use_radial_filters and not self.is_critically_sampled
+		down_filter = self.design_lowpass_filter(numtaps=down_taps, cutoff=out_cutoff, width=out_half_width*2, fs=tmp_sampling_rate, radial=down_radial)
+		down_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=down_taps, cutoff=((1 - alpha) * prev_out_cutoff + alpha * out_cutoff), 
+				width=((1-alpha) * prev_out_half_width + alpha * out_half_width)*2, fs=tmp_sampling_rate, device=device)
+
+		filter_args = {
+			"up_factor": up_factor,
+			"down_factor": down_factor,
+			"up_taps": up_taps,
+			"down_taps": down_taps,
+		}
+
+		return up_filter, down_filter, filter_args
+	
+	def get_down_padding(self,
+		in_size,
+		out_size,
+		up_factor,
+		down_factor,
+		up_taps,
+		down_taps,
+	):
+		# Compute padding.
+		pad_total = (out_size - 1) * down_factor + 1 # Desired output size before downsampling.
+		pad_total -= (in_size + self.conv_kernel - 1) * up_factor # Input size after upsampling.
+		pad_total += up_taps + down_taps - 2 # Size reduction caused by the filters.
+		pad_lo = (pad_total + up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
+		pad_hi = pad_total - pad_lo
+		padding = [int(pad_lo), int(pad_hi), int(pad_lo), int(pad_hi)]
+		return padding
+
+	def get_up_padding(self,
+		in_size,
+		out_size,
+		up_factor,
+		down_factor,
+		up_taps,
+		down_taps,
+	):
+		# Compute padding.
+		tmp_size = (in_size // down_factor + self.conv_kernel - 1)
+		pad_total = (out_size - tmp_size * up_factor)
+		pad_lo = (pad_total) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
+		pad_hi = pad_total - pad_lo
+		padding = [int(pad_lo), int(pad_hi), int(pad_lo), int(pad_hi)]
+		return padding
+	
+	def init_path(self):
+		paths = {}
+		target_resolution = list(self.in_sampling_rate.keys())
+		target_sr_res = []
+		min_sr = min(self.target_sr)
+
+		# Find maximal resolution 
+		for sampling_rate in self.target_sr:
+			# affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=1)
+			# affine = FullyConnectedLayer(self.w_dim, self.weight_gen.freq_dim, bias_init=1)
+			# setattr(self,f'affine_{sampling_rate}',affine)
+			max_res = 0
+			for res, res_sr in self.in_sampling_rate.items():
+				if (sampling_rate == res_sr) and (res > max_res):
+					max_res = res
+			target_sr_res.append(max_res)
+
+		use_alpha_sr = {sr:True for sr in self.target_sr}
+		use_alpha_sr[min_sr] = False
+		for res in target_resolution:
+			cur_res_path = []
+			max_sampling_rate = None
+			for sampling_rate, max_res in zip(self.target_sr[::-1], target_sr_res[::-1]):
+				if self.in_sampling_rate[res] < sampling_rate:
+					continue
+
+				up_filter_name = None,
+				down_filter_name = None,
+				up_args = None
+				down_args = None
+				weight_args = None
+				
+				down_factor = self.in_sampling_rate[res] // sampling_rate
+				if down_factor > 1:
+					# up_filter, down_filter, filter_args = self.get_filter(
+					# 	in_sampling_rate=self.out_sampling_rate[max_res], out_sampling_rate=self.in_sampling_rate[max_res],
+					# 	in_cutoff=self.out_cutoff[max_res], out_cutoff=self.in_cutoff[max_res],
+					# 	in_half_width=self.out_half_width[max_res], out_half_width=self.in_half_width[max_res],
+					# 	filter_size=3 * down_factor, tmp_rate=2
+					# )
+					up_filter = self.design_lowpass_filter(numtaps=down_factor * 6, cutoff=sampling_rate//2, width=(np.sqrt(2) - 1)*sampling_rate, 
+									fs = self.in_size[res] + down_factor * 2)
+									# fs = self.in_size[res] + self.conv_kernel - 1)
+					down_filter = self.design_lowpass_filter(numtaps=down_factor * 6, cutoff=self.in_cutoff[max_res], width=(np.sqrt(2) - 1)*sampling_rate, 
+									fs = self.in_size[res])
+					# padding = self.get_up_padding(in_size=self.in_size[res], out_size=self.in_size[res] + self.conv_kernel - 1,
+					# 			up_factor=down_factor, down_factor=down_factor, up_taps=None, down_taps=None)
+
+					self.register_buffer(f'up_filter_{res}_{sampling_rate}_{down_factor}', up_filter)
+					self.register_buffer(f'down_filter_{res}_{sampling_rate}_{down_factor}', down_filter)
+					
+					up_filter_name = f'up_filter_{res}_{sampling_rate}_{down_factor}'
+					down_filter_name = f'down_filter_{res}_{sampling_rate}_{down_factor}'
+					# up_filter_name = f'up_filter_{max_res}'
+					# down_filter_name = f'down_filter_{max_res}'
+					up_args = {
+						"up": down_factor,
+						# "padding": padding,
+					}
+					down_args = {
+						"down": down_factor,
+					}
+
+				weight_args = {
+					"target_sampling_rate" : sampling_rate,
+					"max_sampling_rate" : max_sampling_rate,
+				}
+				cur_sample_path = dnnlib.EasyDict(
+					path=f'{res}_{sampling_rate}',
+					affine_name=f'affine_{sampling_rate}',
+					up_filter=up_filter_name,
+					down_filter=down_filter_name,
+					up_args=up_args,
+					down_args=down_args,
+					weight_args=weight_args,
+					use_fp16=self.use_fp16[res],
+					use_alpha=use_alpha_sr[sampling_rate]
+				)
+				cur_res_path.append(cur_sample_path)
+				max_sampling_rate = sampling_rate
+				use_alpha_sr[sampling_rate] = False
+
+			paths[res] = cur_res_path
+		self.paths = paths
+				
+
+	def forward(self, x, w, resolution=None, alpha=None, noise_mode='random', force_fp32=False, update_emas=False):
+		assert noise_mode in ['random', 'const', 'none'] # unused
+		assert (resolution is not None) and (alpha is not None)
+		misc.assert_shape(x, [None, self.in_channels, int(self.in_size[resolution]), int(self.in_size[resolution])])
+		misc.assert_shape(w, [x.shape[0], self.w_dim])
+
+		# Track input magnitude.
+		if update_emas:
+			with torch.autograd.profiler.record_function('update_magnitude_ema'):
+				magnitude_cur = x.detach().to(torch.float32).square().mean()
+				self.magnitude_ema.copy_(magnitude_cur.lerp(self.magnitude_ema, self.magnitude_ema_beta))
+		input_gain = self.magnitude_ema.rsqrt()
+
+		path_x = {}
+		path_s = {}
+		# curr_style = self.affine(w)
+		alpha_const = 1
+		# skip_x = modulated_conv2d(x=x, w=self.weight, s=curr_style, padding=1, demodulate=(not self.is_torgb), input_gain=input_gain)
+		alpha_gain = []
+		for path_id, path_args in enumerate(self.paths[resolution]):
+			path_x[path_args.path] = x
+
+			if path_args.down_args:
+				down_filter = getattr(self, path_args.down_filter)
+				path_x[path_args.path] = upfirdn2d.downsample2d(path_x[path_args.path], f=down_filter, **path_args.down_args)
+
+			# Execute affine layer.
+			# path_s[path_args.path] = getattr(self, path_args.affine_name)(w)
+
+			if self.is_torgb:
+				weight_gain = 1 / np.sqrt(self.in_channels * (self.conv_kernel ** 2))
+				styles = styles * weight_gain
+
+			dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+			# curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
+			curr_alpha = alpha.item()  if path_args.use_alpha else 1
+			# curr_alpha = 1
+
+			# if noise_mode == "const":
+			# 	print(self.layer_idx, path_args.path, curr_alpha)
+			# curr_alpha = 0 if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
+			# curr_alpha = alpha.it
+			# Generate weight given alpha
+			weight = self.weight_gen(device=x.device, style=w, **path_args.weight_args)
+			# weight = self.test_weight
+
+			# path_x[path_args.path] = torch.nn.functional.conv2d(path_x[path_args.path].to(dtype), weight=weight.to(dtype),
+			# 							padding=self.conv_kernel-1, groups=self.in_channels)
+
+			# Execute modulated conv2d.
+			# path_x[path_args.path] = modulated_batch_conv2d(x=path_x[path_args.path].to(dtype), w=weight, s=curr_style,
+			# 	padding=self.conv_kernel-1, input_gain=input_gain * np.exp(10 * (curr_alpha - 1))) 
+			path_x[path_args.path] = simple_conv2d(x=path_x[path_args.path].to(dtype), w=weight,
+				padding=self.conv_kernel-1, input_gain=input_gain * curr_alpha) 
+			alpha_gain.append(curr_alpha ** 2)
+			
+			if path_args.up_args:
+				up_filter = getattr(self, path_args.up_filter)
+				path_x[path_args.path] = upfirdn2d.upsample2d(path_x[path_args.path], f=up_filter, impl="ref", **path_args.up_args)
+				pad_size = (self.in_size[resolution] + self.conv_kernel - 1 - path_x[path_args.path].shape[-1]) // 2
+				path_x[path_args.path] = torch.nn.functional.pad(path_x[path_args.path], pad=[pad_size]*4)
+				# t_size = x.shape[-1] + self.conv_kernel - 1
+				# path_x[path_args.path] = torch.nn.functional.interpolate(path_x[path_args.path], mode="bilinear", size=[t_size, t_size])
+			# save_image(path_x[path_args.path][0,:3],f'{resolution}_{self.layer_idx}_{path_args.path}.png') 
+		
+		# if noise_mode == 'const':
+		# 	for k, v in path_x.items():
+		# 		save_image(v[0,:3]*2, f'F{self.layer_idx}_{k}.png')
+
+		x = (sum(path_x.values()).to(dtype)) #/ np.sqrt(sum(alpha_gain))
+
+		# save_image(x[0,:3]*2, f'F{self.layer_idx}_{resolution}.png')
+
+		# x = modulated_conv2d(x=x, w=self.weight, s=curr_style,
+		# 	padding=0, input_gain=input_gain * curr_alpha) 
+
+		# Execute bias, filtered leaky ReLU, and clamping.
+		gain = 1 if self.is_torgb else np.sqrt(2)
+		# gain = 1.1
+		slope = 1 if self.is_torgb else 0.2
+		fd = getattr(self, f'down_filter_{resolution}')(alpha.item(), x.device)
+		fu = getattr(self, f'up_filter_{resolution}')(alpha.item(), x.device)
+		x = filtered_lrelu.filtered_lrelu(x=x, fu=fu, fd=fd, 
+			b=self.bias.to(x.dtype), up=self.up_factor[resolution], down=self.down_factor[resolution], padding=self.padding[resolution], 
+			gain=gain, slope=slope, clamp=self.conv_clamp)
+
+		# Ensure correct shape and dtype.
+		misc.assert_shape(x, [None, self.out_channels, int(self.out_size[resolution]), int(self.out_size[resolution])])
+		assert x.dtype == dtype
+		return x
+
+	@staticmethod
+	def design_lowpass_filter(numtaps, cutoff, width, fs, radial=False, device=None, dtype=torch.float32):
+		assert numtaps >= 1
+
+		# Identity filter.
+		if numtaps == 1:
+			return None
+
+		# Separable Kaiser low-pass filter.
+		if not radial:
+			f = scipy.signal.firwin(numtaps=numtaps, cutoff=cutoff, width=width, fs=fs)
+			return torch.as_tensor(f, dtype=dtype, device=device)
+
+		# Radially symmetric jinc-based filter.
+		x = (np.arange(numtaps) - (numtaps - 1) / 2) / fs
+		r = np.hypot(*np.meshgrid(x, x))
+		f = scipy.special.j1(2 * cutoff * (np.pi * r)) / (np.pi * r)
+		beta = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs / 2)))
+		w = np.kaiser(numtaps, beta)
+		f *= np.outer(w, w)
+		f /= np.sum(f)
+		return torch.as_tensor(f, dtype=dtype, device=device)
+
+	def extra_repr(self):
+		return '\n'.join([
+			f'w_dim={self.w_dim:d}, is_torgb={self.is_torgb},',
+			f'is_critically_sampled={self.is_critically_sampled}, use_fp16={self.use_fp16},',
+			f'in_sampling_rate={self.in_sampling_rate:g}, out_sampling_rate={self.out_sampling_rate:g},',
+			f'in_cutoff={self.in_cutoff:g}, out_cutoff={self.out_cutoff:g},',
+			f'in_half_width={self.in_half_width:g}, out_half_width={self.out_half_width:g},',
+			f'in_size={list(self.in_size)}, out_size={list(self.out_size)},',
+			f'in_channels={self.in_channels:d}, out_channels={self.out_channels:d}'])
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class SynthesisNetwork(torch.nn.Module):
+	def __init__(self,
+		w_dim,                          # Intermediate latent (W) dimensionality.
+		target_resolutions,             # Target resolution lists
+		img_channels,                   # Number of color channels.
+		channel_base        = 32768,    # Overall multiplier for the number of channels.
+		channel_max         = 512,      # Maximum number of channels in any layer.
+		channel_scale       = 1, 
+		num_layers          = 12,       # Total number of layers, excluding Fourier features and ToRGB.
+		num_critical        = 0,        # Number of critically sampled layers at the end.
+		first_cutoff        = 2,        # Cutoff frequency of the first layer (f_{c,0}).
+		first_stopband      = 2**2.1,   # Minimum stopband of the first layer (f_{t,0}).
+		last_stopband_rel   = 2**0.3,   # Minimum stopband of the last layer, expressed relative to the cutoff.
+		margin_size         = 2,       # Number of additional pixels outside the image.
+		output_scale        = 0.25,     # Scale factor for the output image.
+		num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
+		alpha_schedule      = 1e-5,     # per iteration alpha scheduler
+		**layer_kwargs,                 # Arguments for SynthesisLayer.
+	):
+		super().__init__()
+		self.w_dim = w_dim
+		self.num_ws = num_layers + 2
+		self.target_resolutions = sorted(target_resolutions)
+		self.curr_resolution = target_resolutions[0]
+		self.prev_resolution = None
+		self.img_channels = img_channels
+		self.num_layers = num_layers
+		self.num_critical = num_critical
+		self.margin_size = margin_size
+		self.output_scale = output_scale
+		self.num_fp16_res = num_fp16_res
+		self.register_buffer("alpha", torch.ones([]) * 1e-5)
+		self.alpha_schedule = alpha_schedule
+		self.last_stopband_rel = last_stopband_rel
+		self.first_cutoff = first_cutoff
+		self.first_stopband = first_stopband
+
+		band_args_dict = {k: self.compute_band(k,max(self.target_resolutions)) for k in self.target_resolutions}
+		channels = np.rint(np.minimum((channel_base * channel_scale / 2) / band_args_dict[max(self.target_resolutions)].cutoffs, 
+										channel_max * channel_scale))
+
+		input_band_args, self.per_layer_band_args = self.permute_per_layer_band(band_args_dict)
+		
+		# Construct layers.
+		self.input = SynthesisInput(
+			w_dim=self.w_dim, channels=int(channels[0]), **input_band_args)
+		self.layer_names = []
+		for idx in range(self.num_layers):
+			prev = max(idx - 1, 0)
+			is_critically_sampled = (idx >= self.num_layers - self.num_critical)
+			layer = SynthesisLayer(
+				layer_idx=idx, w_dim=self.w_dim, is_torgb=False, is_critically_sampled=is_critically_sampled,
+				in_channels=int(channels[prev]), out_channels= int(channels[idx]), target_resolutions=target_resolutions,
+				**self.per_layer_band_args[idx],
+				**layer_kwargs
+			)
+			name = f'L{idx}_{layer.out_channels}'
+			setattr(self, name, layer)
+			self.layer_names.append(name)
+		
+		# Add toRGB layer
+		layer = ToRGBLayer(w_dim=self.w_dim, is_torgb=True, is_critically_sampled=True, in_channels=int(channels[-1]), out_channels=self.img_channels,
+				target_resolutions=target_resolutions, **self.per_layer_band_args[-1], **layer_kwargs)
+		name = f'L{idx+1}_{layer.out_channels}'
+		setattr(self, name, layer)
+		self.layer_names.append(name)
+	
+	def permute_per_layer_band(self, band_args_dict):
+		per_layer_band_args = []
+		# Add input band args
+		max_res = max(band_args_dict.keys())
+		input_band_args = dnnlib.EasyDict(size={}, 
+							sampling_rate=band_args_dict[max_res].sampling_rates[0], 
+							bandwidth=band_args_dict[max_res].cutoffs[0])
+		for res in band_args_dict.keys():
+			input_band_args.size[res]=int(band_args_dict[res].sizes[0])
+
+		# Add per layer band args
+		for idx in range(self.num_layers + 1):
+			prev = max(idx - 1, 0)
+			idx_band_args = dnnlib.EasyDict(
+				use_fp16={}, in_size={}, out_size={},
+				in_sampling_rate={}, out_sampling_rate={}, 
+				in_cutoff={}, out_cutoff={},
+				in_half_width={}, out_half_width={}
+			)
+			for res, args in band_args_dict.items():
+				use_fp16 = (args.sampling_rates[idx] * (2 ** self.num_fp16_res) > self.target_resolutions[-1])
+				idx_band_args.use_fp16[res] = use_fp16
+				idx_band_args.in_size[res] = int(args.sizes[prev])
+				idx_band_args.out_size[res] = int(args.sizes[idx])
+				idx_band_args.in_sampling_rate[res] = int(args.sampling_rates[prev])
+				idx_band_args.out_sampling_rate[res] = int(args.sampling_rates[idx])
+				idx_band_args.in_cutoff[res] = args.cutoffs[prev] 
+				idx_band_args.out_cutoff[res] = args.cutoffs[idx]
+				idx_band_args.in_half_width[res] = args.half_widths[prev] 
+				idx_band_args.out_half_width[res] = args.half_widths[idx]
+			
+			# TODO: Manual setting, Need to change in future
+			idx_band_args.use_fp16[16] = False
+
+			per_layer_band_args.append(idx_band_args)
+		
+		return input_band_args, per_layer_band_args
+
+	def compute_band(self, img_resolution, max_resolution):
+		# Geometric progression of layer cutoffs and min. stopbands.
+		last_cutoff = img_resolution / 2 # f_{c,N}
+		last_stopband = last_cutoff * self.last_stopband_rel # f_{t,N}
+		exponents = np.minimum(np.arange(self.num_layers + 1) / (self.num_layers - self.num_critical), 1)
+		cutoffs = np.minimum(self.first_cutoff * (last_cutoff / self.first_cutoff) ** exponents, img_resolution//2) # f_c[i]
+		stopbands = np.minimum(self.first_stopband * (last_stopband / self.first_stopband) ** exponents, (img_resolution/2) * (self.last_stopband_rel)) # f_t[i]
+
+		# Compute remaining layer parameters.
+		sampling_rates = np.exp2(np.ceil(np.log2(np.minimum(stopbands * 2, img_resolution)))) # s[i]
+		half_widths = np.maximum(stopbands, sampling_rates / 2) - cutoffs # f_h[i]
+		# margin = max(min(int(self.margin_size * np.log2(img_resolution / 16)),10), 5)
+		margin = 10
+		sizes = sampling_rates + margin * 2
+		sizes[-2:] = img_resolution
+
+		return dnnlib.EasyDict(
+			cutoffs=cutoffs,
+			stopbands=stopbands,
+			half_widths=half_widths,
+			sampling_rates=sampling_rates,
+			sizes=sizes
+		)
+
+	def forward(self, ws, **layer_kwargs):
+		misc.assert_shape(ws, [None, self.num_ws, self.w_dim])
+		ws = ws.to(torch.float32).unbind(dim=1)
+
+		# Execute layers.
+		x = self.input(ws[0], resolution=self.curr_resolution)
+		for name, w in zip(self.layer_names, ws[1:]):
+			x = getattr(self, name)(x, w, resolution=self.curr_resolution, alpha=self.alpha, **layer_kwargs)
+
+		if self.output_scale != 1:
+			x = x * self.output_scale
+
+		# Ensure correct shape and dtype.
+		misc.assert_shape(x, [None, self.img_channels, self.curr_resolution, self.curr_resolution])
+		x = x.to(torch.float32)
+		return x
+
+	def extra_repr(self):
+		return '\n'.join([
+			f'w_dim={self.w_dim:d}, num_ws={self.num_ws:d},',
+			f'img_resolution={self.img_resolution:d}, img_channels={self.img_channels:d},',
+			f'num_layers={self.num_layers:d}, num_critical={self.num_critical:d},',
+			f'margin_size={self.margin_size:d}, num_fp16_res={self.num_fp16_res:d}'])
+
+	def resolution_parameters(self) -> Iterator[Parameter]:
+		return self.parameters()
+		# Input parameters
+		input_params = self.input.parameters()
+
+		# Feature backbone parameters
+		cur_res_params = [input_params]
+		for layer in self.layer_names:
+			cur_res_params.append(getattr(self, layer).parameters())
+			if getattr(self, layer).target_resolution == self.target_resolution:
+				break
+		
+		# ToRGB parameters
+		if self.prev_resolution:
+			cur_res_params.append(getattr(self, self.to_rgb_names[self.prev_resolution]).parameters())
+		cur_res_params.append(getattr(self, self.to_rgb_names[self.target_resolution]).parameters())
+
+		return chain(*cur_res_params)
+	
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class Generator(torch.nn.Module):
+	def __init__(self,
+		z_dim,                      # Input latent (Z) dimensionality.
+		c_dim,                      # Conditioning label (C) dimensionality.
+		w_dim,                      # Intermediate latent (W) dimensionality.
+		target_resolutions,         # Target resolution lists.
+		img_channels,               # Number of output color channels.
+		mapping_kwargs      = {},   # Arguments for MappingNetwork.
+		**synthesis_kwargs,         # Arguments for SynthesisNetwork.
+	):
+		super().__init__()
+		self.z_dim = z_dim
+		self.c_dim = c_dim
+		self.w_dim = w_dim
+		self.target_resolutions = target_resolutions
+		self.img_channels = img_channels
+		self.synthesis = SynthesisNetwork(w_dim=w_dim, target_resolutions=target_resolutions, img_channels=img_channels, **synthesis_kwargs)
+		self.num_ws = self.synthesis.num_ws
+		self.mapping = MappingNetwork(z_dim=z_dim, c_dim=c_dim, w_dim=w_dim, num_ws=self.num_ws, **mapping_kwargs)
+
+	def forward(self, z, c, truncation_psi=1, truncation_cutoff=None, update_emas=False, **synthesis_kwargs):
+		ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
+		img = self.synthesis(ws, update_emas=update_emas, **synthesis_kwargs)
+		return img
+	
+	def set_resolution(self, cur_resolution, alpha=0):
+		self.synthesis.curr_resolution = cur_resolution
+		self.synthesis.alpha.copy_(torch.ones([], device=self.synthesis.alpha.device) * alpha)
+	
+	def resolution_parameters(self):
+		return self.parameters()
+		ws_params = self.mapping.parameters()
+		synth_params = self.synthesis.resolution_parameters()
+		return chain(*[ws_params, synth_params])
+	
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class DiscriminatorBlock(torch.nn.Module):
+	def __init__(self,
+		in_channels,                        # Number of input channels, 0 = first block.
+		tmp_channels,                       # Number of intermediate channels.
+		out_channels,                       # Number of output channels.
+		resolution,                         # Resolution of this block.
+		target_resolutions,					# Resolution of Discriminator targets
+		img_channels,                       # Number of input color channels.
+		first_layer_idx,                    # Index of the first layer.
+		architecture        = 'resnet',     # Architecture: 'orig', 'skip', 'resnet'.
+		activation          = 'lrelu',      # Activation function: 'relu', 'lrelu', etc.
+		resample_filter     = [1,3,3,1],    # Low-pass filter to apply when resampling activations.
+		conv_clamp          = None,         # Clamp the output of convolution layers to +-X, None = disable clamping.
+		use_fp16            = False,        # Use FP16 for this block?
+		fp16_channels_last  = False,        # Use channels-last memory format with FP16?
+		freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
+		frgb                = False,        # For layers which need fromRGB during progressive training
+	):
+		assert in_channels in [0, tmp_channels]
+		assert architecture in ['orig', 'skip', 'resnet']
+		super().__init__()
+		self.in_channels = in_channels
+		self.resolution = resolution
+		self.sampling_rates = {s: s if s <= self.resolution else self.resolution for s in target_resolutions}
+		self.sampling_rates_list = sorted(list(set(self.sampling_rates.values())))
+		self.img_channels = img_channels
+		self.first_layer_idx = first_layer_idx
+		self.architecture = architecture
+		self.use_fp16 = use_fp16
+		self.channels_last = (use_fp16 and fp16_channels_last)
+		self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
+
+		self.num_layers = 0
+		def trainable_gen():
+			while True:
+				layer_idx = self.first_layer_idx + self.num_layers
+				trainable = (layer_idx >= freeze_layers)
+				self.num_layers += 1
+				yield trainable
+		trainable_iter = trainable_gen()
+
+		if in_channels == 0 or architecture == 'skip' or frgb:
+			self.fromrgb = Conv2dLayer(img_channels, tmp_channels, kernel_size=1, activation=activation,
+				trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
+
+		self.kernel_size = 3
+		self.conv_clamp = conv_clamp
+		self.activation = activation
+		self.act_gain = bias_act.activation_funcs[activation].def_gain
+		self.conv0_weight = SynthesisGroupKernel(tmp_channels, tmp_channels, ks=self.kernel_size, sampling_rate=self.sampling_rates_list, trainable_f=False)
+		self.conv0_bias = torch.nn.Parameter(torch.zeros([tmp_channels]))
+		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, ks=self.kernel_size, sampling_rate=self.sampling_rates_list, trainable_f=False)
+		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
+
+		self.conv0_padding = {}
+		self.conv1_padding = {}
+		self.conv0_filter_args = {}
+		self.conv1_filter_args = {}
+
+		for res in target_resolutions:
+			sampling_rate = self.sampling_rates[res]
+			prev_sampling_rate = self.sampling_rates[res//2] if res//2 in self.sampling_rates else self.sampling_rates[res]
+			up_filter, down_filter, filter_args = self.get_filter(in_sampling_rate=sampling_rate, out_sampling_rate=sampling_rate, 
+							in_cutoff=sampling_rate/2, out_cutoff=sampling_rate/2, 
+							in_half_width=sampling_rate*((np.sqrt(2) - 1)/2), out_half_width=sampling_rate*((np.sqrt(2) - 1)/2), 
+							prev_in_cutoff=prev_sampling_rate/2, prev_out_cutoff=prev_sampling_rate/2,
+							prev_in_half_width=prev_sampling_rate*((np.sqrt(2) - 1)/2), prev_out_half_width=prev_sampling_rate*((np.sqrt(2) - 1)/2),
+							tmp_rate=2, filter_size=4)
+			
+			padding = self.get_down_padding(in_size=sampling_rate, out_size=sampling_rate, **filter_args)
+			setattr(self, f'conv0_up_filter_{res}', up_filter)
+			setattr(self, f'conv0_down_filter_{res}', down_filter)
+			self.conv0_padding[res] = padding
+			self.conv0_filter_args[res] = filter_args
+			out_sampling_rate = sampling_rate/2 if sampling_rate == self.resolution else sampling_rate
+			prev_out_sampling_rate = prev_sampling_rate/2 if prev_sampling_rate == self.resolution else prev_sampling_rate
+
+			up_filter, down_filter, filter_args = self.get_filter(in_sampling_rate=sampling_rate, out_sampling_rate=out_sampling_rate, in_cutoff=sampling_rate/2, out_cutoff=out_sampling_rate/2, 
+							in_half_width=sampling_rate*((np.sqrt(2) - 1)/2), out_half_width=out_sampling_rate*((np.sqrt(2) - 1)/2), 
+							prev_in_cutoff=prev_sampling_rate/2, prev_out_cutoff=prev_out_sampling_rate/2,
+							prev_in_half_width=prev_sampling_rate*((np.sqrt(2) - 1)/2), prev_out_half_width=prev_out_sampling_rate*((np.sqrt(2) - 1)/2),
+							tmp_rate=2, filter_size=4)
+			
+			padding = self.get_down_padding(in_size=sampling_rate, out_size=out_sampling_rate, **filter_args)
+			setattr(self, f'conv1_up_filter_{res}', up_filter)
+			setattr(self, f'conv1_down_filter_{res}', down_filter)
+			self.conv1_padding[res] = padding
+			self.conv1_filter_args[res] = filter_args
+
+		if architecture == 'resnet':
+			self.skip = Conv2dLayer(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
+				trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
+
+	def get_down_padding(self,
+		in_size,
+		out_size,
+		up_factor,
+		down_factor,
+		up_taps,
+		down_taps,
+	):
+		# Compute padding.
+		pad_total = (out_size - 1) * down_factor + 1 # Desired output size before downsampling.
+		pad_total -= (in_size + self.kernel_size - 1) * up_factor # Input size after upsampling.
+		pad_total += up_taps + down_taps - 2 # Size reduction caused by the filters.
+		pad_lo = (pad_total + up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
+		pad_hi = pad_total - pad_lo
+		padding = [int(pad_lo), int(pad_hi), int(pad_lo), int(pad_hi)]
+		return padding
+
+	@staticmethod
+	def design_lowpass_filter(numtaps, cutoff, width, fs, radial=False, device=None, dtype=torch.float32):
+		assert numtaps >= 1
+
+		# Identity filter.
+		if numtaps == 1:
+			return None
+
+		# Separable Kaiser low-pass filter.
+		if not radial:
+			f = scipy.signal.firwin(numtaps=numtaps, cutoff=cutoff, width=width, fs=fs)
+			return torch.as_tensor(f, dtype=dtype, device=device)
+
+		# Radially symmetric jinc-based filter.
+		x = (np.arange(numtaps) - (numtaps - 1) / 2) / fs
+		r = np.hypot(*np.meshgrid(x, x))
+		f = scipy.special.j1(2 * cutoff * (np.pi * r)) / (np.pi * r)
+		beta = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs / 2)))
+		w = np.kaiser(numtaps, beta)
+		f *= np.outer(w, w)
+		f /= np.sum(f)
+		return torch.as_tensor(f, dtype=dtype, device=device)
+
+	def get_filter(self, 
+		in_sampling_rate, 
+		out_sampling_rate, 
+		in_cutoff,
+		out_cutoff,
+		in_half_width,
+		out_half_width,
+		prev_in_cutoff,
+		prev_out_cutoff,
+		prev_in_half_width,
+		prev_out_half_width,
+		tmp_rate,
+		filter_size = None,
+	):
+		tmp_sampling_rate= max(in_sampling_rate, out_sampling_rate) * tmp_rate
+		filter_size = filter_size if filter_size is not None else self.filter_size
+
+		# Design upsampling filter.
+		up_factor = int(np.rint(tmp_sampling_rate / in_sampling_rate))
+		assert in_sampling_rate * up_factor == tmp_sampling_rate 
+		up_taps = filter_size * up_factor 
+		up_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=up_taps, cutoff=((1 - alpha) * prev_in_cutoff + alpha * in_cutoff), 
+				width=((1 - alpha) * prev_in_half_width + alpha * in_half_width)*2, fs=tmp_sampling_rate, device=device)
+
+		# Design downsampling filter.
+		down_factor = int(np.rint(tmp_sampling_rate/ out_sampling_rate))
+		assert out_sampling_rate * down_factor == tmp_sampling_rate 
+		down_taps = filter_size * down_factor
+		down_radial = False
+		down_filter = self.design_lowpass_filter(numtaps=down_taps, cutoff=out_cutoff, width=out_half_width*2, fs=tmp_sampling_rate, radial=down_radial)
+		down_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=down_taps, cutoff=((1 - alpha) * prev_out_cutoff + alpha * out_cutoff), 
+				width=((1-alpha) * prev_out_half_width + alpha * out_half_width)*2, fs=tmp_sampling_rate, device=device)
+
+		filter_args = {
+			"up_factor": up_factor,
+			"down_factor": down_factor,
+			"up_taps": up_taps,
+			"down_taps": down_taps,
+		}
+
+		return up_filter, down_filter, filter_args
+
+	def forward(self, x, img, resolution, alpha=None, force_fp32=False):
+		if (x if x is not None else img).device.type != 'cuda':
+			force_fp32 = True
+		dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
+		memory_format = torch.channels_last if self.channels_last and not force_fp32 else torch.contiguous_format
+		sample_size = min(self.resolution, resolution)
+		curr_down = 2 if sample_size == self.resolution else 1
+		max_sample_rate = self.sampling_rates[resolution]
+
+		# Input.
+		if x is not None:
+			misc.assert_shape(x, [None, self.in_channels, sample_size, sample_size])
+			x = x.to(dtype=dtype, memory_format=memory_format)
+
+		# FromRGB.
+		if self.in_channels == 0 or self.architecture == 'skip':
+			misc.assert_shape(img, [None, self.img_channels, sample_size, sample_size])
+			img = img.to(dtype=dtype, memory_format=memory_format)
+			y = self.fromrgb(img)
+			x = x + y if x is not None else y
+			img = upfirdn2d.downsample2d(img, self.resample_filter) if (self.architecture == 'skip') else None
+
+		# Main layers.
+		if self.architecture == 'resnet':
+			y = self.skip(x, gain=np.sqrt(0.5), down=curr_down)
+
+			conv0_x = {}
+			conv0_w = {}
+			alpha_gain = []
+			max_res=None	
+			for res in self.sampling_rates_list[::-1]:
+				if res > max_sample_rate:
+					continue
+				# curr_alpha = alpha.item() if res == resolution else 1
+				curr_alpha = 1
+				# curr_alpha = alpha.item()
+				alpha_gain.append(curr_alpha ** 2)
+				conv0_w[res] = self.conv0_weight(res, max_res, x.device).to(dtype=x.dtype)
+				if max_sample_rate // res > 1:
+					conv0_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=max_sample_rate // res)
+					conv0_x[res] = conv2d_resample.conv2d_resample(x=conv0_x[res], w=conv0_w[res], padding=self.kernel_size-1) * curr_alpha
+					conv0_x[res] = upfirdn2d.upsample2d(conv0_x[res], self.resample_filter, up=max_sample_rate // res)
+					pad_size = ((x.shape[-1] + 2) - conv0_x[res].shape[-1])//2
+					conv0_x[res] = torch.nn.functional.pad(conv0_x[res], pad=[pad_size]*4)
+				else:
+					conv0_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv0_w[res], padding=self.kernel_size-1) * curr_alpha
+				conv0_x[res] = conv0_x[res].unsqueeze(0)
+				max_res = res
+			alpha_gain = sum(alpha_gain)
+			conv0_x = torch.cat(list(conv0_x.values()), dim=0).sum(dim=0).to(dtype=x.dtype) #/ np.sqrt(alpha_gain)
+			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
+
+			fd = getattr(self, f'conv0_down_filter_{resolution}')(alpha.item(), x.device)
+			fu = getattr(self, f'conv0_up_filter_{resolution}')(alpha.item(), x.device)
+			filter_args = self.conv0_filter_args[resolution]
+
+			x = filtered_lrelu.filtered_lrelu(x=conv0_x, fu=fu, fd=fd, b=self.conv0_bias.to(dtype=x.dtype), 
+						up=filter_args["up_factor"], down=filter_args["down_factor"], padding=self.conv0_padding[resolution], clamp=act_clamp, gain=self.act_gain)
+			# x = bias_act.bias_act(conv0_x, self.conv0_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain, clamp=act_clamp)
+
+			conv1_x = {}
+			conv1_w = {}
+			alpha_gain = []
+			max_res = None
+			for res in self.sampling_rates_list[::-1]:
+				if res > max_sample_rate:
+					continue
+				# curr_alpha = alpha.item() if res == resolution else 1
+				curr_alpha = 1
+				alpha_gain.append(curr_alpha ** 2)
+				conv1_w[res] = self.conv1_weight(res, max_res, x.device).to(dtype=x.dtype)
+				if max_sample_rate // res > 1:
+					conv1_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=max_sample_rate // res)
+					conv1_x[res] = conv2d_resample.conv2d_resample(x=conv1_x[res], w=conv1_w[res], padding=self.kernel_size-1) * curr_alpha
+					conv1_x[res] = upfirdn2d.upsample2d(conv1_x[res], self.resample_filter, up=max_sample_rate // res)
+					pad_size = ((x.shape[-1] + 2) - conv1_x[res].shape[-1])//2
+					conv1_x[res] = torch.nn.functional.pad(conv1_x[res], pad=[pad_size]*4)
+				else:
+					conv1_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv1_w[res], padding=self.kernel_size-1) * curr_alpha
+				conv1_x[res] = conv1_x[res].unsqueeze(0)
+				max_res = res
+			alpha_gain = sum(alpha_gain)
+			conv1_x = torch.cat(list(conv1_x.values()), dim=0).sum(dim=0).to(dtype=x.dtype) #/ np.sqrt(alpha_gain)
+			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
+			# conv1_x = upfirdn2d.downsample2d(conv1_x, self.resample_filter, down=curr_down)
+
+			fd = getattr(self, f'conv1_down_filter_{resolution}')(alpha.item(), x.device)
+			fu = getattr(self, f'conv1_up_filter_{resolution}')(alpha.item(), x.device)
+			filter_args = self.conv1_filter_args[resolution]
+
+			x = filtered_lrelu.filtered_lrelu(x=conv1_x, fu=fu, fd=fd, b=self.conv1_bias.to(dtype=x.dtype), 
+						up=filter_args["up_factor"], down=filter_args["down_factor"], padding=self.conv1_padding[resolution], clamp=act_clamp, gain=self.act_gain)
+			# x = bias_act.bias_act(conv1_x, self.conv1_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain * 0.5, clamp=act_clamp)
+			x = y.add_(x)
+		else:
+			x = self.conv0(x)
+			x = self.conv1(x)
+
+		assert x.dtype == dtype
+		return x, img
+
+	def extra_repr(self):
+		return f'resolution={self.resolution:d}, architecture={self.architecture:s}'
+	
+	def conv_parameters(self):
+		params = [
+			self.conv0.parameters(),
+			self.conv1.parameters()
+		]
+		if self.architecture == "resnet":
+			params.append(self.skip.parameters())
+		return chain(*params)
+	
+	def frgb_parameters(self):
+		params = []
+		if hasattr(self, 'fromrgb'):
+			params.append(self.fromrgb.parameters())
+		return chain(*params)
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class MinibatchStdLayer(torch.nn.Module):
+	def __init__(self, group_size, num_channels=1):
+		super().__init__()
+		self.group_size = group_size
+		self.num_channels = num_channels
+
+	def forward(self, x):
+		N, C, H, W = x.shape
+		with misc.suppress_tracer_warnings(): # as_tensor results are registered as constants
+			G = torch.min(torch.as_tensor(self.group_size), torch.as_tensor(N)) if self.group_size is not None else N
+		F = self.num_channels
+		c = C // F
+
+		y = x.reshape(G, -1, F, c, H, W)    # [GnFcHW] Split minibatch N into n groups of size G, and channels C into F groups of size c.
+		y = y - y.mean(dim=0)               # [GnFcHW] Subtract mean over group.
+		y = y.square().mean(dim=0)          # [nFcHW]  Calc variance over group.
+		y = (y + 1e-8).sqrt()               # [nFcHW]  Calc stddev over group.
+		y = y.mean(dim=[2,3,4])             # [nF]     Take average over channels and pixels.
+		y = y.reshape(-1, F, 1, 1)          # [nF11]   Add missing dimensions.
+		y = y.repeat(G, 1, H, W)            # [NFHW]   Replicate over group and pixels.
+		x = torch.cat([x, y], dim=1)        # [NCHW]   Append to input as new channels.
+		return x
+
+	def extra_repr(self):
+		return f'group_size={self.group_size}, num_channels={self.num_channels:d}'
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class DiscriminatorEpilogue(torch.nn.Module):
+	def __init__(self,
+		in_channels,                    # Number of input channels.
+		cmap_dim,                       # Dimensionality of mapped conditioning label, 0 = no label.
+		resolution,                     # Resolution of this block.
+		img_channels,                   # Number of input color channels.
+		architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+		mbstd_group_size    = 4,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
+		mbstd_num_channels  = 1,        # Number of features for the minibatch standard deviation layer, 0 = disable.
+		activation          = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
+		conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
+	):
+		assert architecture in ['orig', 'skip', 'resnet']
+		super().__init__()
+		self.in_channels = in_channels
+		self.cmap_dim = cmap_dim
+		self.resolution = resolution
+		self.img_channels = img_channels
+		self.architecture = architecture
+
+		if architecture == 'skip':
+			self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
+		self.mbstd = MinibatchStdLayer(group_size=mbstd_group_size, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
+		self.conv = Conv2dLayer(in_channels + mbstd_num_channels, in_channels, kernel_size=3, activation=activation, conv_clamp=conv_clamp)
+		self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
+		self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)
+
+	def forward(self, x, img, cmap, force_fp32=False):
+		misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution]) # [NCHW]
+		_ = force_fp32 # unused
+		dtype = torch.float32
+		memory_format = torch.contiguous_format
+
+		# FromRGB.
+		x = x.to(dtype=dtype, memory_format=memory_format)
+		if self.architecture == 'skip':
+			misc.assert_shape(img, [None, self.img_channels, self.resolution, self.resolution])
+			img = img.to(dtype=dtype, memory_format=memory_format)
+			x = x + self.fromrgb(img)
+
+		# Main layers.
+		if self.mbstd is not None:
+			x = self.mbstd(x)
+		x = self.conv(x)
+		x = self.fc(x.flatten(1))
+		x = self.out(x)
+
+		# Conditioning.
+		if self.cmap_dim > 0:
+			misc.assert_shape(cmap, [None, self.cmap_dim])
+			x = (x * cmap).sum(dim=1, keepdim=True) * (1 / np.sqrt(self.cmap_dim))
+
+		assert x.dtype == dtype
+		return x
+
+	def extra_repr(self):
+		return f'resolution={self.resolution:d}, architecture={self.architecture:s}'
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
+class Discriminator(torch.nn.Module):
+	def __init__(self,
+		c_dim,                          # Conditioning label (C) dimensionality.
+		target_resolutions,             # Target resolution list.
+		img_channels,                   # Number of input color channels.
+		architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+		channel_base        = 32768,    # Overall multiplier for the number of channels.
+		channel_max         = 512,      # Maximum number of channels in any layer.
+		num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
+		conv_clamp          = 256,      # Clamp the output of convolution layers to +-X, None = disable clamping.
+		cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
+		alpha_schedule      = 1e-5,     # Schedule rate for alpha
+		block_kwargs        = {},       # Arguments for DiscriminatorBlock.
+		mapping_kwargs      = {},       # Arguments for MappingNetwork.
+		epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
+	):
+		super().__init__()
+		self.c_dim = c_dim
+		self.target_resolutions = target_resolutions
+		self.max_resolution = max(target_resolutions)
+		self.curr_resolution = min(target_resolutions)
+		self.prev_resolution = None
+		self.max_resolution_log2 = int(np.log2(self.max_resolution))
+		self.img_channels = img_channels
+		self.block_resolutions = [2 ** i for i in range(self.max_resolution_log2, 2, -1)]
+		self.register_buffer("alpha", torch.ones([])*1e-5)
+		self.alpha_schedule = alpha_schedule
+
+		channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
+		fp16_resolution = max(2 ** (self.max_resolution_log2 + 1 - num_fp16_res), 8)
+
+		if cmap_dim is None:
+			cmap_dim = channels_dict[4]
+		if c_dim == 0:
+			cmap_dim = 0
+
+		common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
+		cur_layer_idx = 0
+		min_res = min(self.target_resolutions)
+
+		for res in self.block_resolutions:
+			in_channels = channels_dict[res] if res < self.max_resolution else 0
+			tmp_channels = channels_dict[res]
+			out_channels = channels_dict[res // 2]
+			use_fp16 = (res >= fp16_resolution)
+			frgb = res >= self.curr_resolution
+			block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res, target_resolutions=self.target_resolutions,
+				first_layer_idx=cur_layer_idx, use_fp16=use_fp16, frgb=frgb, **block_kwargs, **common_kwargs)
+			setattr(self, f'b{res}', block)
+			cur_layer_idx += block.num_layers
+		if c_dim > 0:
+			self.mapping = MappingNetwork(z_dim=0, c_dim=c_dim, w_dim=cmap_dim, num_ws=None, w_avg_beta=None, **mapping_kwargs)
+		self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
+ 
+	def forward(self, img, c, update_emas=False, **block_kwargs):
+		x = None
+		for res in self.block_resolutions:
+			block = getattr(self, f'b{res}')
+			x, img = block(x, img, self.curr_resolution, alpha=self.alpha, **block_kwargs)
+
+		cmap = None
+		if self.c_dim > 0:
+			cmap = self.mapping(None, c)
+		x = self.b4(x, img, cmap)
+		return x
+
+	def extra_repr(self):
+		return f'c_dim={self.c_dim:d}, img_resolution={self.img_resolution:d}, img_channels={self.img_channels:d}'
+	
+	def set_resolution(self, resolution):
+		self.prev_resolution = self.curr_resolution
+		self.curr_resolution = resolution
+		self.alpha.copy_(torch.zeros([], device=self.alpha.device))
+	
+	def resolution_parameters(self) -> Iterator[Parameter]:
+		return self.parameters()
+#----------------------------------------------------------------------------
