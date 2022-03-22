@@ -594,24 +594,24 @@ class SynthesisGroupKernel(torch.nn.Module):
 		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs)
 		ix = ix + in_phases.unsqueeze(2).unsqueeze(3)
 		ix = torch.sin(ix * (np.pi * 2)) #+ self.freq_bias * 0.1
-		ix *= np.exp((min(self.sampling_rate) / target_sampling_rate) ** 2 - 1)
+		# ix *= np.exp((min(self.sampling_rate) / target_sampling_rate) ** 2 - 1)
 
 		#Compute cutoff frequency for butterworth filter based on alpha
 
 		freq_norm = in_freqs.norm(dim=-1)
 		low_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
-		# high_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
+		high_filter = torch.ones([self.in_channels,self.freq_dim], device=in_freqs.device)
 
 		if target_sampling_rate != min(self.sampling_rate):
 			low_cutoff = target_sampling_rate / 2
 			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
-		# if max_sampling_rate != None:
-		# 	high_cutoff = max_sampling_rate / 2
-		# 	high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
+		if max_sampling_rate != None:
+			high_cutoff = max_sampling_rate / 2
+			high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 		
 		max_filter = (1 / (1 + (freq_norm / self.bandlimit) ** (2 * self.butterN)))
 
-		curr_filter = (max_filter * low_filter)
+		curr_filter = (high_filter * low_filter)
 		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * max_filter.square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
 		# ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2)).unsqueeze(0)
 
@@ -1490,10 +1490,125 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, ks=self.kernel_size, sampling_rate=self.sampling_rates_list, trainable_f=False)
 		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
 
+		self.conv0_padding = {}
+		self.conv1_padding = {}
+		self.conv0_filter_args = {}
+		self.conv1_filter_args = {}
+
+		for res in target_resolutions:
+			sampling_rate = self.sampling_rates[res]
+			prev_sampling_rate = self.sampling_rates[res//2] if res//2 in self.sampling_rates else res
+			up_filter, down_filter, filter_args = self.get_filter(in_sampling_rate=sampling_rate, out_sampling_rate=sampling_rate, in_cutoff=sampling_rate/2, out_cutoff=sampling_rate/2, 
+							in_half_width=sampling_rate*((np.sqrt(2) - 1)/2), out_half_width=sampling_rate*((np.sqrt(2) - 1)/2), 
+							prev_in_cutoff=prev_sampling_rate/2, prev_out_cutoff=prev_sampling_rate/2,
+							prev_in_half_width=prev_sampling_rate*((np.sqrt(2) - 1)/2), prev_out_half_width=prev_sampling_rate*((np.sqrt(2) - 1)/2),
+							tmp_rate=2, filter_size=4)
+			
+			padding = self.get_down_padding(in_size=sampling_rate, out_size=sampling_rate, **filter_args)
+			setattr(self, f'conv0_up_filter_{res}', up_filter)
+			setattr(self, f'conv0_down_filter_{res}', down_filter)
+			self.conv0_padding[res] = padding
+			self.conv0_filter_args[res] = filter_args
+			out_sampling_rate = sampling_rate/2 if sampling_rate == self.resolution else sampling_rate
+			prev_out_sampling_rate = prev_sampling_rate/2 if prev_sampling_rate == self.resolution else prev_sampling_rate
+
+			up_filter, down_filter, filter_args = self.get_filter(in_sampling_rate=sampling_rate, out_sampling_rate=out_sampling_rate, in_cutoff=sampling_rate/2, out_cutoff=out_sampling_rate/2, 
+							in_half_width=sampling_rate*((np.sqrt(2) - 1)/2), out_half_width=out_sampling_rate*((np.sqrt(2) - 1)/2), 
+							prev_in_cutoff=prev_sampling_rate/2, prev_out_cutoff=prev_out_sampling_rate/2,
+							prev_in_half_width=prev_sampling_rate*((np.sqrt(2) - 1)/2), prev_out_half_width=prev_out_sampling_rate*((np.sqrt(2) - 1)/2),
+							tmp_rate=2, filter_size=4)
+			
+			padding = self.get_down_padding(in_size=sampling_rate, out_size=out_sampling_rate, **filter_args)
+			setattr(self, f'conv1_up_filter_{res}', up_filter)
+			setattr(self, f'conv1_down_filter_{res}', down_filter)
+			self.conv1_padding[res] = padding
+			self.conv1_filter_args[res] = filter_args
 
 		if architecture == 'resnet':
 			self.skip = Conv2dLayer(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
 				trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
+
+	def get_down_padding(self,
+		in_size,
+		out_size,
+		up_factor,
+		down_factor,
+		up_taps,
+		down_taps,
+	):
+		# Compute padding.
+		pad_total = (out_size - 1) * down_factor + 1 # Desired output size before downsampling.
+		pad_total -= (in_size + self.kernel_size - 1) * up_factor # Input size after upsampling.
+		pad_total += up_taps + down_taps - 2 # Size reduction caused by the filters.
+		pad_lo = (pad_total + up_factor) // 2 # Shift sample locations according to the symmetric interpretation (Appendix C.3).
+		pad_hi = pad_total - pad_lo
+		padding = [int(pad_lo), int(pad_hi), int(pad_lo), int(pad_hi)]
+		return padding
+
+	@staticmethod
+	def design_lowpass_filter(numtaps, cutoff, width, fs, radial=False, device=None, dtype=torch.float32):
+		assert numtaps >= 1
+
+		# Identity filter.
+		if numtaps == 1:
+			return None
+
+		# Separable Kaiser low-pass filter.
+		if not radial:
+			f = scipy.signal.firwin(numtaps=numtaps, cutoff=cutoff, width=width, fs=fs)
+			return torch.as_tensor(f, dtype=dtype, device=device)
+
+		# Radially symmetric jinc-based filter.
+		x = (np.arange(numtaps) - (numtaps - 1) / 2) / fs
+		r = np.hypot(*np.meshgrid(x, x))
+		f = scipy.special.j1(2 * cutoff * (np.pi * r)) / (np.pi * r)
+		beta = scipy.signal.kaiser_beta(scipy.signal.kaiser_atten(numtaps, width / (fs / 2)))
+		w = np.kaiser(numtaps, beta)
+		f *= np.outer(w, w)
+		f /= np.sum(f)
+		return torch.as_tensor(f, dtype=dtype, device=device)
+
+	def get_filter(self, 
+		in_sampling_rate, 
+		out_sampling_rate, 
+		in_cutoff,
+		out_cutoff,
+		in_half_width,
+		out_half_width,
+		prev_in_cutoff,
+		prev_out_cutoff,
+		prev_in_half_width,
+		prev_out_half_width,
+		tmp_rate,
+		filter_size = None,
+	):
+		tmp_sampling_rate= max(in_sampling_rate, out_sampling_rate) * tmp_rate
+		filter_size = filter_size if filter_size is not None else self.filter_size
+
+		# Design upsampling filter.
+		up_factor = int(np.rint(tmp_sampling_rate / in_sampling_rate))
+		assert in_sampling_rate * up_factor == tmp_sampling_rate 
+		up_taps = filter_size * up_factor 
+		up_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=up_taps, cutoff=((1 - alpha) * prev_in_cutoff + alpha * in_cutoff), 
+				width=((1 - alpha) * prev_in_half_width + alpha * in_half_width)*2, fs=tmp_sampling_rate, device=device)
+
+		# Design downsampling filter.
+		down_factor = int(np.rint(tmp_sampling_rate/ out_sampling_rate))
+		assert out_sampling_rate * down_factor == tmp_sampling_rate 
+		down_taps = filter_size * down_factor
+		down_radial = False
+		down_filter = self.design_lowpass_filter(numtaps=down_taps, cutoff=out_cutoff, width=out_half_width*2, fs=tmp_sampling_rate, radial=down_radial)
+		down_filter = lambda alpha, device : self.design_lowpass_filter(numtaps=down_taps, cutoff=((1 - alpha) * prev_out_cutoff + alpha * out_cutoff), 
+				width=((1-alpha) * prev_out_half_width + alpha * out_half_width)*2, fs=tmp_sampling_rate, device=device)
+
+		filter_args = {
+			"up_factor": up_factor,
+			"down_factor": down_factor,
+			"up_taps": up_taps,
+			"down_taps": down_taps,
+		}
+
+		return up_filter, down_filter, filter_args
 
 	def forward(self, x, img, resolution, alpha=None, force_fp32=False):
 		if (x if x is not None else img).device.type != 'cuda':
@@ -1534,16 +1649,23 @@ class DiscriminatorBlock(torch.nn.Module):
 				conv0_w[res] = self.conv0_weight(res, max_res, x.device).to(dtype=x.dtype)
 				if max_sample_rate // res > 1:
 					conv0_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=max_sample_rate // res)
-					conv0_x[res] = conv2d_resample.conv2d_resample(x=conv0_x[res], w=conv0_w[res], padding=self.kernel_size//2) * curr_alpha
+					conv0_x[res] = conv2d_resample.conv2d_resample(x=conv0_x[res], w=conv0_w[res], padding=self.kernel_size-1) * curr_alpha
 					conv0_x[res] = upfirdn2d.upsample2d(conv0_x[res], self.resample_filter, up=max_sample_rate // res)
 				else:
-					conv0_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv0_w[res], padding=self.kernel_size//2) * curr_alpha
+					conv0_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv0_w[res], padding=self.kernel_size-1) * curr_alpha
 				conv0_x[res] = conv0_x[res].unsqueeze(0)
 				max_res = res
 			alpha_gain = sum(alpha_gain)
 			conv0_x = torch.cat(list(conv0_x.values()), dim=0).sum(dim=0).to(dtype=x.dtype) / np.sqrt(alpha_gain)
 			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
-			x = bias_act.bias_act(conv0_x, self.conv0_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain, clamp=act_clamp)
+
+			fd = getattr(self, f'conv0_down_filter_{resolution}')(alpha.item(), x.device)
+			fu = getattr(self, f'conv0_up_filter_{resolution}')(alpha.item(), x.device)
+			filter_args = self.conv0_filter_args[resolution]
+
+			x = filtered_lrelu.filtered_lrelu(x=conv0_x, fu=fu, fd=fd, b=self.conv0_bias.to(dtype=x.dtype), 
+						up=filter_args["up_factor"], down=filter_args["down_factor"], padding=self.conv0_padding[resolution], clamp=act_clamp, gain=self.act_gain)
+			# x = bias_act.bias_act(conv0_x, self.conv0_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain, clamp=act_clamp)
 
 			conv1_x = {}
 			conv1_w = {}
@@ -1557,17 +1679,24 @@ class DiscriminatorBlock(torch.nn.Module):
 				conv1_w[res] = self.conv1_weight(res, max_res, x.device).to(dtype=x.dtype)
 				if max_sample_rate // res > 1:
 					conv1_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=max_sample_rate // res)
-					conv1_x[res] = conv2d_resample.conv2d_resample(x=conv1_x[res], w=conv1_w[res], padding=self.kernel_size//2) * curr_alpha
+					conv1_x[res] = conv2d_resample.conv2d_resample(x=conv1_x[res], w=conv1_w[res], padding=self.kernel_size-1) * curr_alpha
 					conv1_x[res] = upfirdn2d.upsample2d(conv1_x[res], self.resample_filter, up=max_sample_rate // res)
 				else:
-					conv1_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv1_w[res], padding=self.kernel_size//2) * curr_alpha
+					conv1_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv1_w[res], padding=self.kernel_size-1) * curr_alpha
 				conv1_x[res] = conv1_x[res].unsqueeze(0)
 				max_res = res
 			alpha_gain = sum(alpha_gain)
 			conv1_x = torch.cat(list(conv1_x.values()), dim=0).sum(dim=0).to(dtype=x.dtype) / np.sqrt(alpha_gain)
-			conv1_x = upfirdn2d.downsample2d(conv1_x, self.resample_filter, down=curr_down)
 			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
-			x = bias_act.bias_act(conv1_x, self.conv1_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain * 0.5, clamp=act_clamp)
+			# conv1_x = upfirdn2d.downsample2d(conv1_x, self.resample_filter, down=curr_down)
+
+			fd = getattr(self, f'conv1_down_filter_{resolution}')(alpha.item(), x.device)
+			fu = getattr(self, f'conv1_up_filter_{resolution}')(alpha.item(), x.device)
+			filter_args = self.conv1_filter_args[resolution]
+
+			x = filtered_lrelu.filtered_lrelu(x=conv1_x, fu=fu, fd=fd, b=self.conv1_bias.to(dtype=x.dtype), 
+						up=filter_args["up_factor"], down=filter_args["down_factor"], padding=self.conv1_padding[resolution], clamp=act_clamp, gain=self.act_gain)
+			# x = bias_act.bias_act(conv1_x, self.conv1_bias.to(dtype=x.dtype), act=self.activation, gain=self.act_gain * 0.5, clamp=act_clamp)
 			x = y.add_(x)
 		else:
 			x = self.conv0(x)
