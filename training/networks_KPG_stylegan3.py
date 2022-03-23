@@ -372,7 +372,7 @@ class SynthesisInput(torch.nn.Module):
 		x = (grids.unsqueeze(3) @ freqs.permute(0, 2, 1).unsqueeze(1).unsqueeze(2)).squeeze(3) # [batch, height, width, channel]
 		x = x + phases.unsqueeze(1).unsqueeze(2)
 		x_var = x.square().mean(dim=[0,3], keepdim=True)
-		x = torch.sin(x * (np.pi * 2)) * (-0.5 * x_var).exp()
+		x = torch.sin(x * (np.pi * 2)) #* (-0.5 * x_var).exp()
 		x = x * amplitudes.unsqueeze(1).unsqueeze(2)
 
 		# Apply trainable mapping.
@@ -539,7 +539,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		sampling_rate,
 		bandlimit = None,
 		freq_dim = 64,
-		butterN = 1,
+		butterN = 3,
 		trainable_f = False,
 		layer_idx = None,
 		style_dim = 32,
@@ -594,8 +594,8 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 		ix = torch.einsum('bhwr,ifr->bihwf', grids, in_freqs)
 		ix = ix + in_phases.unsqueeze(2).unsqueeze(3)
-		ix_var = ix.square().mean(dim=[0,1], keepdim=True)
-		ix = torch.sin(ix * (np.pi * 2)) * ((-0.5) * ix_var).exp() #+ self.freq_bias * 0.1
+		# ix_var = ix.square().mean(dim=[0,1], keepdim=True)
+		ix = torch.sin(ix * (np.pi * 2)) #* ((-0.5) * ix_var).exp() #+ self.freq_bias * 0.1
 		# ix *= np.exp((min(self.sampling_rate) / target_sampling_rate) ** 2 - 1)
 
 		#Compute cutoff frequency for butterworth filter based on alpha
@@ -608,8 +608,8 @@ class SynthesisGroupKernel(torch.nn.Module):
 			low_cutoff = target_sampling_rate
 			low_filter = (1 / (1 + (freq_norm / low_cutoff) ** (-2 * self.butterN))) 
 
-		# high_cutoff = max_sampling_rate
-		# high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
+		high_cutoff = max_sampling_rate
+		high_filter = (1 / (1 + (freq_norm / high_cutoff) ** (2 * self.butterN))) 
 		
 		max_filter = (1 / (1 + (freq_norm / self.bandlimit) ** (2 * self.butterN)))
 
@@ -619,11 +619,16 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 		if style is not None:
 			im = self.affine_mag(style)
-			freq_weight = self.freq_weight.unsqueeze(0) * im.unsqueeze(-1)
+			freq_weight = self.freq_weight
+			weight = self.weight
+			weight = weight * weight.square().mean(dim=1, keepdim=True).rsqrt()
+			weight = weight.unsqueeze(0) * im.unsqueeze(1)
+			weight = weight * (weight.square().sum(dim=1, keepdim=True) + 1e-8).rsqrt()
+			# freq_weight = self.freq_weight.unsqueeze(0) * im.unsqueeze(-1)
 			# freq_weight = freq_weight * freq_weight.square().mean(dim=1, keepdim=True).rsqrt()
-			kernel = torch.einsum('bihwf,bif,oi->boihw', ix, freq_weight, self.weight) * np.sqrt(2 / self.freq_dim)
+			kernel = torch.einsum('bihwf,if,boi->boihw', ix, freq_weight, weight) * np.sqrt(2 / self.freq_dim)
 		else:
-			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim)
+			kernel = torch.einsum('bihwf,if,oi->boihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / self.freq_dim) * self.gain
 
 		assert torch.isfinite(kernel).all().item()
 
@@ -633,7 +638,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		# if style is not None:
 		# 	return kernel
 		
-		return kernel.squeeze(0) * self.gain
+		return kernel.squeeze(0)
 		# return kernel
 	
 #----------------------------------------------------------------------------
@@ -1051,11 +1056,11 @@ class SynthesisLayer(torch.nn.Module):
 					# 	in_half_width=self.out_half_width[max_res], out_half_width=self.in_half_width[max_res],
 					# 	filter_size=3 * down_factor, tmp_rate=2
 					# )
-					up_filter = self.design_lowpass_filter(numtaps=down_factor * 6, cutoff=sampling_rate//2, width=(np.sqrt(2) - 1)*sampling_rate, 
-									fs = self.in_size[res] + down_factor * 2)
+					up_filter = self.design_lowpass_filter(numtaps=down_factor * 6, cutoff=sampling_rate/2, width=(np.sqrt(2) - 1)*sampling_rate, 
+									fs = self.in_sampling_rate[res])
 									# fs = self.in_size[res] + self.conv_kernel - 1)
-					down_filter = self.design_lowpass_filter(numtaps=down_factor * 6, cutoff=self.in_cutoff[max_res], width=(np.sqrt(2) - 1)*sampling_rate, 
-									fs = self.in_size[res])
+					down_filter = self.design_lowpass_filter(numtaps=down_factor * 6, cutoff=sampling_rate/2, width=(np.sqrt(2) - 1)*sampling_rate, 
+									fs = self.in_sampling_rate[res])
 					# padding = self.get_up_padding(in_size=self.in_size[res], out_size=self.in_size[res] + self.conv_kernel - 1,
 					# 			up_factor=down_factor, down_factor=down_factor, up_taps=None, down_taps=None)
 
@@ -1133,8 +1138,8 @@ class SynthesisLayer(torch.nn.Module):
 			dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
 			# curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
-			curr_alpha = alpha.item()  if path_args.use_alpha else 1
-			# curr_alpha = 1
+			# curr_alpha = alpha.item()  if path_args.use_alpha else 1
+			curr_alpha = 1
 
 			# if noise_mode == "const":
 			# 	print(self.layer_idx, path_args.path, curr_alpha)
@@ -1455,6 +1460,7 @@ class DiscriminatorBlock(torch.nn.Module):
 		fp16_channels_last  = False,        # Use channels-last memory format with FP16?
 		freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
 		frgb                = False,        # For layers which need fromRGB during progressive training
+		conv_kernel			= 3,
 	):
 		assert in_channels in [0, tmp_channels]
 		assert architecture in ['orig', 'skip', 'resnet']
@@ -1483,7 +1489,7 @@ class DiscriminatorBlock(torch.nn.Module):
 			self.fromrgb = Conv2dLayer(img_channels, tmp_channels, kernel_size=1, activation=activation,
 				trainable=next(trainable_iter), conv_clamp=conv_clamp, channels_last=self.channels_last)
 
-		self.kernel_size = 3
+		self.kernel_size = conv_kernel
 		self.conv_clamp = conv_clamp
 		self.activation = activation
 		self.act_gain = bias_act.activation_funcs[activation].def_gain
@@ -1655,7 +1661,7 @@ class DiscriminatorBlock(torch.nn.Module):
 					conv0_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=max_sample_rate // res)
 					conv0_x[res] = conv2d_resample.conv2d_resample(x=conv0_x[res], w=conv0_w[res], padding=self.kernel_size-1) * curr_alpha
 					conv0_x[res] = upfirdn2d.upsample2d(conv0_x[res], self.resample_filter, up=max_sample_rate // res)
-					pad_size = ((x.shape[-1] + 2) - conv0_x[res].shape[-1])//2
+					pad_size = ((x.shape[-1] + self.kernel_size - 1) - conv0_x[res].shape[-1])//2
 					conv0_x[res] = torch.nn.functional.pad(conv0_x[res], pad=[pad_size]*4)
 				else:
 					conv0_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv0_w[res], padding=self.kernel_size-1) * curr_alpha
@@ -1688,7 +1694,7 @@ class DiscriminatorBlock(torch.nn.Module):
 					conv1_x[res] = upfirdn2d.downsample2d(x, self.resample_filter, down=max_sample_rate // res)
 					conv1_x[res] = conv2d_resample.conv2d_resample(x=conv1_x[res], w=conv1_w[res], padding=self.kernel_size-1) * curr_alpha
 					conv1_x[res] = upfirdn2d.upsample2d(conv1_x[res], self.resample_filter, up=max_sample_rate // res)
-					pad_size = ((x.shape[-1] + 2) - conv1_x[res].shape[-1])//2
+					pad_size = ((x.shape[-1] + self.kernel_size-1) - conv1_x[res].shape[-1])//2
 					conv1_x[res] = torch.nn.functional.pad(conv1_x[res], pad=[pad_size]*4)
 				else:
 					conv1_x[res] = conv2d_resample.conv2d_resample(x=x, w=conv1_w[res], padding=self.kernel_size-1) * curr_alpha
@@ -1837,6 +1843,7 @@ class Discriminator(torch.nn.Module):
 		conv_clamp          = 256,      # Clamp the output of convolution layers to +-X, None = disable clamping.
 		cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
 		alpha_schedule      = 1e-5,     # Schedule rate for alpha
+		conv_kernel			= 3,
 		block_kwargs        = {},       # Arguments for DiscriminatorBlock.
 		mapping_kwargs      = {},       # Arguments for MappingNetwork.
 		epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
@@ -1872,7 +1879,7 @@ class Discriminator(torch.nn.Module):
 			use_fp16 = (res >= fp16_resolution)
 			frgb = res >= self.curr_resolution
 			block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res, target_resolutions=self.target_resolutions,
-				first_layer_idx=cur_layer_idx, use_fp16=use_fp16, frgb=frgb, **block_kwargs, **common_kwargs)
+				first_layer_idx=cur_layer_idx, use_fp16=use_fp16, frgb=frgb, conv_kernel=conv_kernel, **block_kwargs, **common_kwargs)
 			setattr(self, f'b{res}', block)
 			cur_layer_idx += block.num_layers
 		if c_dim > 0:
