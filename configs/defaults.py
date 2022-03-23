@@ -21,6 +21,7 @@ _C.G_kwargs.z_dim                       = 512 # Size of Latent Z
 _C.G_kwargs.w_dim                       = 512 # Size of StyleCode W
 _C.G_kwargs.channel_base                = CBASE
 _C.G_kwargs.channel_max                 = CMAX
+_C.G_kwargs.conv_kernel                 = 1
 
 #-------------------------------------------------------------------------------
 # Cfg about Generator.MappingNetwork
@@ -48,6 +49,7 @@ _C.D_kwargs                             = CN(new_allowed=True)
 _C.D_kwargs.class_name                  = "training.networks_stylegan2.Discriminator"
 _C.D_kwargs.channel_base                = CBASE
 _C.D_kwargs.channel_max                 = CMAX
+_C.D_kwargs.conv_kernel                 = 1
 
 #-------------------------------------------------------------------------------
 # Cfg about Discriminator.DiscriminatorBlock
