@@ -1586,6 +1586,39 @@ class MinibatchStdLayer(torch.nn.Module):
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
+class GroupMinibatchStdLayer(torch.nn.Module):
+	def __init__(self, min_group_size, group_num, num_channels=1):
+		super().__init__()
+		self.min_group_size = min_group_size
+		self.group_num = group_num
+		self.num_channels = num_channels
+
+	def forward(self, x):
+		N, C, H, W = x.shape
+		with misc.suppress_tracer_warnings(): # as_tensor results are registered as constants
+			# G = torch.min(torch.as_tensor(self.group_num), torch.as_tensor(N)) if self.group_num is not None else N
+			G = N // self.group_num
+			assert G >= self.min_group_size
+			# G = torch.min(torch.as_tensor(self.group_size), torch.as_tensor(N)) if self.group_size is not None else N
+		F = self.num_channels
+		c = C // F
+
+		y = x.reshape(G, -1, F, c, H, W)    # [GnFcHW] Split minibatch N into n groups of size G, and channels C into F groups of size c.
+		y = y - y.mean(dim=0)               # [GnFcHW] Subtract mean over group.
+		y = y.square().mean(dim=0)          # [nFcHW]  Calc variance over group.
+		y = (y + 1e-8).sqrt()               # [nFcHW]  Calc stddev over group.
+		y = y.mean(dim=[2,3,4])             # [nF]     Take average over channels and pixels.
+		y = y.reshape(-1, F, 1, 1)          # [nF11]   Add missing dimensions.
+		y = y.repeat(G, 1, H, W)            # [NFHW]   Replicate over group and pixels.
+		x = torch.cat([x, y], dim=1)        # [NCHW]   Append to input as new channels.
+		return x
+
+	def extra_repr(self):
+		return f'group_size={self.group_size}, num_channels={self.num_channels:d}'
+
+#----------------------------------------------------------------------------
+
+@persistence.persistent_class
 class DiscriminatorEpilogue(torch.nn.Module):
 	def __init__(self,
 		in_channels,                    # Number of input channels.
@@ -1593,6 +1626,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
 		resolution,                     # Resolution of this block.
 		img_channels,                   # Number of input color channels.
 		architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+		mbstd_group_num    	= 4,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
 		mbstd_group_size    = 4,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
 		mbstd_num_channels  = 1,        # Number of features for the minibatch standard deviation layer, 0 = disable.
 		activation          = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
@@ -1608,7 +1642,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
 
 		if architecture == 'skip':
 			self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
-		self.mbstd = MinibatchStdLayer(group_size=mbstd_group_size, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
+		self.mbstd = GroupMinibatchStdLayer(min_group_size=mbstd_group_size, group_num=mbstd_group_num, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
 		self.conv = Conv2dLayer(in_channels + mbstd_num_channels, in_channels, kernel_size=3, activation=activation, conv_clamp=conv_clamp)
 		self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
 		self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)

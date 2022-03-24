@@ -477,12 +477,12 @@ class BaseTrainer:
 			phase.opt.zero_grad(set_to_none=True)
 			phase.module.requires_grad_(True)
 			for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
-				if 'D' in phase['name']:
-					curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 1) * 4
-					real_img = real_img[:curr_batch]
-					real_c = real_c[:curr_batch]
-					gen_z = gen_z[:curr_batch]
-					gen_c = gen_c[:curr_batch]
+				# if 'D' in phase['name']:
+				curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
+				real_img = real_img[:curr_batch]
+				real_c = real_c[:curr_batch]
+				gen_z = gen_z[:curr_batch]
+				gen_c = gen_c[:curr_batch]
 				loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
 			phase.module.requires_grad_(False)
 
