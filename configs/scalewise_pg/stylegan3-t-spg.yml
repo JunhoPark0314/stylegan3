@@ -1,0 +1,38 @@
+G_kwargs:
+  class_name: 'training.networks_SPG_stylegan3.Generator'
+  alpha_schedule:
+    inline: 'lambda x,y : 1 / y'
+    x: 'batch_size'
+    y: 'loop_kwargs.alpha_kimg' 
+  magnitude_ema_beta: 
+    inline: 'lambda x : 0.5 ** (x / (20 * 1e3))'
+    x: 'batch_size'
+  num_layers: 14
+  num_critical: 2
+
+# G_opt_kwargs:
+#   class_name: 'torch.optim.SGD'
+  # lr: 0.01
+#   momentum: 0.9
+#   replace: True
+
+D_kwargs:
+  class_name: 'training.networks_SPG_stylegan3.Discriminator'
+  alpha_schedule:
+    inline: 'lambda x,y : 1 / y'
+    x: 'batch_size'
+    y: 'loop_kwargs.alpha_kimg' 
+
+# D_opt_kwargs:
+#   class_name: 'torch.optim.SGD'
+  # lr: 0.01
+#   momentum: 0.9
+#   replace: True
+
+data:
+  resolution: [32, 64, 128, 256, 512]
+  max_batch : 64
+
+loop_kwargs:
+  class_name: 'training.training_loop.ProgressiveTrainer'
+  alpha_kimg: 200000 # 600K images 
