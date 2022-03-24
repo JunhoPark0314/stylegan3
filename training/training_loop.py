@@ -232,7 +232,8 @@ class BaseTrainer:
 				mb_ratio = reg_interval / (reg_interval + 1)
 				opt_kwargs = dnnlib.EasyDict(opt_kwargs)
 				opt_kwargs.lr = opt_kwargs.lr * mb_ratio
-				opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
+				if 'Adam' in opt_kwargs.class_name:
+					opt_kwargs.betas = [beta ** mb_ratio for beta in opt_kwargs.betas]
 				opt = dnnlib.util.construct_class_by_name(self.get_params(module), **opt_kwargs) # subclass of torch.optim.Optimizer
 				phases += [dnnlib.EasyDict(name=name+'main', module=module, opt=opt, interval=1)]
 				phases += [dnnlib.EasyDict(name=name+'reg', module=module, opt=opt, interval=reg_interval)]
@@ -476,6 +477,12 @@ class BaseTrainer:
 			phase.opt.zero_grad(set_to_none=True)
 			phase.module.requires_grad_(True)
 			for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
+				if 'D' in phase['name']:
+					curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 1) * 4
+					real_img = real_img[:curr_batch]
+					real_c = real_c[:curr_batch]
+					gen_z = gen_z[:curr_batch]
+					gen_c = gen_c[:curr_batch]
 				loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
 			phase.module.requires_grad_(False)
 
