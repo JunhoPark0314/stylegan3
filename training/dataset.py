@@ -271,7 +271,7 @@ class MultiResDataLoader:
         self.cur_res = self.resolution[0]
         max_res = max(self.resolution)
         self.per_res_batch = {
-            res : (max(c.max_batch * num_gpus, int((max_res / res) * batch_size)) // num_gpus) * num_gpus
+            res : (min(c.max_batch * num_gpus, int((max_res / res) * batch_size)) // num_gpus) * num_gpus
             for res in self.resolution
         }
         self.per_res_batch_gpu = {

@@ -1190,7 +1190,8 @@ class SynthesisNetwork(torch.nn.Module):
 
 	def compute_band(self, img_resolution, max_resolution):
 		# Geometric progression of layer cutoffs and min. stopbands.
-		last_cutoff = img_resolution / 2 # f_{c,N}
+		# last_cutoff = img_resolution / 2 # f_{c,N}
+		last_cutoff = max_resolution / 2 # f_{c,N}
 		last_stopband = last_cutoff * self.last_stopband_rel # f_{t,N}
 		exponents = np.minimum(np.arange(self.num_layers + 1) / (self.num_layers - self.num_critical), 1)
 		cutoffs = np.minimum(self.first_cutoff * (last_cutoff / self.first_cutoff) ** exponents, img_resolution//2) # f_c[i]
