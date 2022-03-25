@@ -369,7 +369,7 @@ class BaseTrainer:
 				print('Aborting...')
 
 		grid_size, grid_z, grid_c, _ = self.setup_snapshot_image_grid()
-		self.checkpointer.save_image(progress_info, grid_z, grid_c, grid_size)
+		self.checkpointer.save_image(progress_info, grid_z, grid_c, grid_size, self.D.curr_resolution)
 		snap_progress = EasyDict(
 			cur_tick=self.pg_info.cur_tick,
 			cur_nimg=self.pg_info.cur_nimg,
@@ -411,6 +411,7 @@ class BaseTrainer:
 			- device            : Current device id used in training
 		"""
 		batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
+		curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
 		G = self.G
 		G_ema = self.G_ema
 
@@ -426,7 +427,7 @@ class BaseTrainer:
 				b_ema.copy_(b)
 
 		# Update state.
-		progress_info.cur_nimg += batch_size
+		progress_info.cur_nimg += curr_batch
 		progress_info.batch_idx += 1
 
 		# Execute ADA heuristic.
@@ -539,7 +540,9 @@ class ProgressiveTrainer(BaseTrainer):
 	):
 		super().update_per_batch(progress_info)
 		batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-		cur_alpha = torch.ones([]) * (batch_size / self.alpha_kimg)
+		curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
+		# cur_alpha = torch.ones([]) * (batch_size/ self.alpha_kimg)
+		cur_alpha = torch.ones([]) * (curr_batch / self.alpha_kimg)
 		self.G.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
 		self.D.alpha.copy_(torch.clip(self.D.alpha + cur_alpha, min=0, max=1))
 		self.G_ema.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
@@ -697,6 +700,7 @@ class Checkpointer:
 		grid_z,
 		grid_c,
 		grid_size,
+		curr_res=None,
 	):
 		done = progress_info.done
 		cur_nimg = progress_info.cur_nimg
@@ -706,11 +710,14 @@ class Checkpointer:
 		# Save image snapshot.
 		if (rank == 0) and (self.image_snapshot_ticks is not None) and (done or cur_tick % self.image_snapshot_ticks == 0):
 			# target_resolutions = self.G_ema.target_resolutions
-			# for res in target_resolutions:
-			# 	self.G_ema.set_resolution(res)
-			res = self.G_ema.synthesis.curr_resolution
-			images = torch.cat([self.G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-			save_image_grid(images, os.path.join(self.run_dir, f'fakes_{cur_nimg//1000:06d}_{res}.png'), drange=[-1,1], grid_size=grid_size)
+			min_res = max(curr_res//2, 32)
+			max_res = min(curr_res * 2, 512)
+			target_resolutions = list(set([min_res, curr_res, max_res]))
+			for res in target_resolutions:
+				self.G_ema.set_resolution(res)
+			# res = self.G_ema.synthesis.curr_resolution
+				images = torch.cat([self.G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+				save_image_grid(images, os.path.join(self.run_dir, f'fakes_{cur_nimg//1000:06d}_{res}.png'), drange=[-1,1], grid_size=grid_size)
 
 	def save_pkl(
 		self, 
