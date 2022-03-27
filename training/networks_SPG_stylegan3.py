@@ -48,6 +48,9 @@ def modulated_batch_conv2d(
 	if demodulate:
 		w = w * w.square().mean([2,3,4], keepdim=True).rsqrt()
 		s = s * s.square().mean().rsqrt()
+	else:
+		w = w * np.sqrt(1 / (in_channels * kh * kw))
+		s = s * s.square().mean().rsqrt()
 
 	# Modulate weights.
 	# w = w.unsqueeze(0) # [NOIkk]
@@ -462,7 +465,7 @@ class SynthesisKernel(torch.nn.Module):
 
 		# out_freqs = self.out_freqs
 		# out_phases = self.out_phases
-		# ot = self.ot
+		# ot = self.otF
 
 		# transforms = self.transform
 
@@ -539,71 +542,90 @@ class SynthesisGroupKernel(torch.nn.Module):
 		# freq_dim = 128,
 		sampling_rate = 16,
 		layer_idx = None,
+		w_dim = None,
+		butterN = 4,
+		alpha_const = 16,
 	):
 		super().__init__()
 		self.in_channels = in_channels
 		self.out_channels = out_channels
 		self.sampling_rate = sampling_rate
-		self.bandlimit = sampling_rate * (2 ** -0.9)
+		self.bandlimit = sampling_rate #* (2 ** -0.9)
 		self.freq_dim = max(in_channels, out_channels)
+		self.layer_idx = layer_idx
 		
 		# radii = torch.randn(1, self.freq_dim, 1) * self.bandlimit
 		# angle = (torch.rand(1, self.freq_dim, 1) - 0.5) * 2 * np.pi
 		# freqs = torch.cat([radii * angle.sin(), radii * angle.cos()], dim=-1)
-		freqs = torch.randn([in_channels, self.freq_dim, 2])
+		if self.layer_idx is not None:
+			freqs = torch.randn([1, self.freq_dim, 2])
+		else:
+			freqs = torch.randn([in_channels, self.freq_dim, 2])
 		radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
 		freqs /= radii * radii.square().exp().pow(0.25)
 		freqs *= self.bandlimit
 		self.register_buffer("freqs", freqs)
+
 		self.phases = torch.nn.Parameter((torch.randn([in_channels, self.freq_dim])))
-		self.phase_whole = torch.nn.Parameter((torch.rand([1, self.freq_dim]) -0.5))
+		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]) * 0.1)
 
-		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
-		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
-		# freq_weight = torch.randn([in_channels, self.freq_dim])
-		# self.register_buffer("freq_weight", freq_weight)
-		self.layer_idx = layer_idx
+		if self.layer_idx is not None:
+			self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels]))
+			self.style_mag = FullyConnectedLayer(w_dim, self.freq_dim, weight_init=0, bias_init=1, lr_multiplier=0.01)
+		else:
+			self.freq_out = torch.nn.Parameter(torch.randn([out_channels, self.freq_dim]))
 		self.gain = lambda x : 1 if self.layer_idx is not None else np.sqrt(1 / (in_channels * (x**2)))
-		self.test_weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, 3, 3]))
+		self.alpha_const = alpha_const
+		self.butterN = butterN
 
-	def forward(self, device, ks, alpha):
+	def forward(self, device, ks, alpha=1, style=None):
 		# Sample signal
 		sample_size = ks
 		in_freqs = self.freqs
-		# in_phases = (self.phases + self.phase_whole) / 2
-		# in_phases = (self.phases * np.sqrt(self.sampling_rate)).sin()
-		in_phases = self.phases
+		in_phases = self.phases.unsqueeze(0)
+		# if style is not None:
+		# 	t = self.style_phase(style).view(-1, self.freq_dim, 2)
+		# 	m_t = torch.eye(3, device=device).view(1,1,3,3).repeat(style.shape[0], self.freq_dim,1,1)
+		# 	m_t[...,0,2] = -t[...,0]
+		# 	m_t[...,1,2] = -t[...,1]
+		# 	style_phase = torch.einsum('ifr,bfrh->bif',in_freqs, m_t[...,:2,2:])
+		# 	in_phases = self.phases.unsqueeze(0) + style_phase
+		# else:
+		# 	in_phases = self.phases.unsqueeze(0)
 
 		theta = torch.eye(2, 3, device=device)
 		theta[0, 0] = 0.5 * sample_size / (self.sampling_rate)
 		theta[1, 1] = 0.5 * sample_size / (self.sampling_rate)
 		grids = torch.nn.functional.affine_grid(theta.unsqueeze(0), [1, 1, sample_size, sample_size], align_corners=False).squeeze(0)
-		zero_filter = torch.from_numpy(scipy.signal.gauss_spline(grids.cpu().numpy() * self.sampling_rate * (1-alpha), 1)).to(device)
-		zero_filter = (zero_filter[...,0] * zero_filter[...,1]).sqrt()
-		zero_filter = zero_filter #* zero_filter.square().sum().rsqrt()
+
+		ix = torch.einsum('hwr,ifr->ihwf', grids, in_freqs).unsqueeze(0)
+		ix = ix + in_phases.unsqueeze(2).unsqueeze(3)
+		ix = torch.sin(ix * (np.pi * 2)) 
+		freq_norm = in_freqs.norm(dim=-1)
+
+		low_cutoff = (1 - alpha) * min(self.alpha_const, self.bandlimit) + alpha * self.bandlimit
+		low_filter = 1 / (1 + (freq_norm / low_cutoff) ** (2 * self.butterN)).sqrt()
+		freq_weight = self.freq_weight.sigmoid() * low_filter
+		# freq_weight = (self.freq_weight + (1 - alpha) * self.alpha_const * (1 - freq_norm / self.bandlimit)).sigmoid()
+		if style is not None:
+			style_mag = self.style_mag(style)
+			freq_weight = torch.einsum('if,bf->bif', freq_weight, style_mag)
+		freq_mag = (freq_weight.square().sum(dim=-1) + 1e-8).rsqrt() * np.sqrt(2)
 
 		if self.layer_idx is not None:
-			ix = torch.einsum('hwr,ifr->ihwf', grids, in_freqs)
-			ix = ix + in_phases.unsqueeze(1).unsqueeze(2)
-			ix = torch.sin(ix * (np.pi * 2)) 
-			i_kernel = torch.einsum('ihwf,if->ihw', ix, self.freq_weight) / np.sqrt(self.freq_dim)
-			weight = self.weight
-			# i_kernel = i_kernel * i_kernel.square().mean(dim=[1,2], keepdim=True).rsqrt()
-			# weight = self.weight * self.weight.square().mean(dim=[-1], keepdim=True).rsqrt()
-			kernel = torch.einsum('ihw,oi->oihw', i_kernel, weight)
-
-			#Compute cutoff frequency for butterworth filter based on alpha
-			# kernel = torch.einsum('ihwf,if,oi->oihw', ix, self.freq_weight, self.weight) * np.sqrt(1 / (self.freq_dim)) 
+			weight = self.weight * self.weight.square().mean(dim=[-1], keepdim=True).rsqrt()
+			kernel = torch.einsum('bihwf,bif,oi->boihw',ix, freq_weight, weight) 
 		else:
-			if ks == 1:
-				kernel = self.test_weight[...,1,1].view(self.out_channels, self.in_channels, 1, 1)
-			else:
-				kernel = self.test_weight
-		kernel = kernel * zero_filter.expand_as(kernel) * self.gain(ks)
+			ix = ix.squeeze(0)
+			# freq_weight = self.freq_weight * self.freq_weight.square().mean(dim=-1, keepdim=True).rsqrt()
+			freq_out = self.freq_out * self.freq_out.square().mean(dim=-1, keepdim=True).rsqrt()
+			kernel = torch.einsum('ihwf,if,of->oihw', ix, freq_weight, freq_out) #* np.sqrt(2/self.freq_dim)
 
-		return kernel
+		kernel = kernel * freq_mag.view(-1, 1, self.in_channels, 1, 1) * np.sqrt(2) * self.gain(ks)
+
+		return kernel.squeeze(0)
 		# return kernel
-	
+
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
@@ -895,7 +917,7 @@ class SynthesisLayer(torch.nn.Module):
 		# Path initialization
 		target_sr = sorted(list(set(self.in_sampling_rate.values())))
 		self.target_sr = target_sr
-		self.weight_gen = SynthesisGroupKernel(in_channels=self.in_channels, out_channels=out_channels, layer_idx=self.layer_idx, sampling_rate=max(target_sr))
+		self.weight_gen = SynthesisGroupKernel(in_channels=self.in_channels, out_channels=out_channels, layer_idx=self.layer_idx, sampling_rate=max(target_sr), w_dim=self.w_dim)
 		self.init_path()
 		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
 		self.register_buffer('magnitude_ema', torch.ones([]))
@@ -1032,10 +1054,10 @@ class SynthesisLayer(torch.nn.Module):
 		path_args = self.paths[resolution]
 		dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 		curr_alpha = alpha.item()  if path_args.use_alpha else 1
-		weight = self.weight_gen(device=x.device, ks=path_args.ks, alpha=curr_alpha)
+		weight = self.weight_gen(device=x.device, ks=path_args.ks, alpha=curr_alpha, style=w)
 		curr_style = self.affine(w)
 
-		x = modulated_conv2d(x=x.to(dtype), w=weight, s=curr_style, padding=path_args.ks-1, input_gain=input_gain, demodulate=self.is_critically_sampled) 
+		x = modulated_batch_conv2d(x=x.to(dtype), w=weight, s=curr_style, padding=path_args.ks-1, input_gain=input_gain, demodulate=self.is_critically_sampled) 
 		outgain = x.square().mean(dim=[2,3], keepdim=True).rsqrt()
 		if not self.is_critically_sampled:
 			x = x * outgain * self.gamma.view(1, -1, 1, 1)
@@ -1060,6 +1082,7 @@ class SynthesisLayer(torch.nn.Module):
 		x = filtered_lrelu.filtered_lrelu(x=x, fu=fu, fd=fd, 
 			b=self.bias.to(x.dtype), up=self.up_factor[resolution], down=self.down_factor[resolution], padding=padding, 
 			gain=gain, slope=slope, clamp=self.conv_clamp)
+		x = x.to(dtype)
 
 		# Ensure correct shape and dtype.
 		misc.assert_shape(x, [None, self.out_channels, int(self.out_size[resolution]), int(self.out_size[resolution])])
@@ -1623,7 +1646,7 @@ class GroupMinibatchStdLayer(torch.nn.Module):
 		with misc.suppress_tracer_warnings(): # as_tensor results are registered as constants
 			# G = torch.min(torch.as_tensor(self.group_num), torch.as_tensor(N)) if self.group_num is not None else N
 			G = N // self.group_num
-			assert G >= self.min_group_size
+			# assert G >= self.min_group_size
 			# G = torch.min(torch.as_tensor(self.group_size), torch.as_tensor(N)) if self.group_size is not None else N
 		F = self.num_channels
 		c = C // F
@@ -1651,8 +1674,8 @@ class DiscriminatorEpilogue(torch.nn.Module):
 		resolution,                     # Resolution of this block.
 		img_channels,                   # Number of input color channels.
 		architecture        = 'resnet', # Architecture: 'orig', 'skip', 'resnet'.
+		mbstd_group_size    = 2,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
 		mbstd_group_num    	= 4,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
-		mbstd_group_size    = 4,        # Group size for the minibatch standard deviation layer, None = entire minibatch.
 		mbstd_num_channels  = 1,        # Number of features for the minibatch standard deviation layer, 0 = disable.
 		activation          = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
 		conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
@@ -1670,6 +1693,8 @@ class DiscriminatorEpilogue(torch.nn.Module):
 		# self.mbstd = MinibatchStdLayer(group_size=mbstd_group_size, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
 		self.mbstd = GroupMinibatchStdLayer(min_group_size=mbstd_group_size, group_num=mbstd_group_num, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
 		self.conv = Conv2dLayer(in_channels + mbstd_num_channels, in_channels, kernel_size=3, activation=activation, conv_clamp=conv_clamp)
+		self.weight_gen = SynthesisGroupKernel(in_channels, in_channels, sampling_rate=4)
+		self.bias = torch.nn.Parameter(torch.zeros([in_channels]))
 		self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
 		self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)
 
@@ -1690,7 +1715,10 @@ class DiscriminatorEpilogue(torch.nn.Module):
 		if self.mbstd is not None:
 			x = self.mbstd(x)
 		x = self.conv(x)
-		x = self.fc(x.flatten(1))
+		w = self.weight_gen(x.device, ks=4).to(x.dtype)
+		x = conv2d_gradfix.conv2d(x, w, self.bias.to(x.dtype)).squeeze(-1).squeeze(-1)
+		x = torch.nn.functional.leaky_relu(x)
+		# x = self.fc(x.flatten(1))
 		x = self.out(x)
 
 		# Conditioning.

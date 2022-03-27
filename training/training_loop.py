@@ -411,7 +411,8 @@ class BaseTrainer:
 			- device            : Current device id used in training
 		"""
 		batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-		curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
+		curr_batch = batch_size
+		# curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
 		G = self.G
 		G_ema = self.G_ema
 
@@ -479,11 +480,11 @@ class BaseTrainer:
 			phase.module.requires_grad_(True)
 			for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
 				# if 'D' in phase['name']:
-				curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
-				real_img = real_img[:curr_batch]
-				real_c = real_c[:curr_batch]
-				gen_z = gen_z[:curr_batch]
-				gen_c = gen_c[:curr_batch]
+				# curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
+				# real_img = real_img[:curr_batch]
+				# real_c = real_c[:curr_batch]
+				# gen_z = gen_z[:curr_batch]
+				# gen_c = gen_c[:curr_batch]
 				loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
 			phase.module.requires_grad_(False)
 
@@ -540,7 +541,8 @@ class ProgressiveTrainer(BaseTrainer):
 	):
 		super().update_per_batch(progress_info)
 		batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-		curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
+		curr_batch = batch_size
+		# curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
 		# cur_alpha = torch.ones([]) * (batch_size/ self.alpha_kimg)
 		cur_alpha = torch.ones([]) * (curr_batch / self.alpha_kimg)
 		self.G.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
@@ -710,8 +712,8 @@ class Checkpointer:
 		# Save image snapshot.
 		if (rank == 0) and (self.image_snapshot_ticks is not None) and (done or cur_tick % self.image_snapshot_ticks == 0):
 			# target_resolutions = self.G_ema.target_resolutions
-			min_res = max(curr_res//2, 32)
-			max_res = min(curr_res * 2, 512)
+			min_res = max(curr_res//2, 128)
+			max_res = min(curr_res * 2, 128)
 			target_resolutions = list(set([min_res, curr_res, max_res]))
 			for res in target_resolutions:
 				self.G_ema.set_resolution(res)
