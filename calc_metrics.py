@@ -14,6 +14,7 @@ import json
 import tempfile
 import copy
 import torch
+from glob import glob
 
 import dnnlib
 import legacy
@@ -28,6 +29,9 @@ from torch_utils.ops import conv2d_gradfix
 
 def subprocess_fn(rank, args, temp_dir):
     dnnlib.util.Logger(should_flush=True)
+    with dnnlib.util.open_url(args["network_pkl"], verbose=args.verbose) as f:
+        network_dict = legacy.load_network_pkl(f)
+        args.G = network_dict['G_ema'] # subclass of torch.nn.Module
 
     # Init torch.distributed.
     if args.num_gpus > 1:
@@ -87,14 +91,14 @@ def parse_comma_separated_list(s):
 
 @click.command()
 @click.pass_context
-@click.option('network_pkl', '--network', help='Network pickle filename or URL', metavar='PATH', required=True)
+@click.option('network_path', '--network', help='Network pickle filename or URL', metavar='PATH', required=True)
 @click.option('--metrics', help='Quality metrics', metavar='[NAME|A,B,C|none]', type=parse_comma_separated_list, default='fid50k_full', show_default=True)
 @click.option('--data', help='Dataset to evaluate against  [default: look up]', metavar='[ZIP|DIR]')
 @click.option('--mirror', help='Enable dataset x-flips  [default: look up]', type=bool, metavar='BOOL')
 @click.option('--gpus', help='Number of GPUs to use', type=int, default=1, metavar='INT', show_default=True)
 @click.option('--verbose', help='Print optional information', type=bool, default=True, metavar='BOOL', show_default=True)
 
-def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
+def calc_metrics(ctx, network_path, metrics, data, mirror, gpus, verbose):
     """Calculate quality metrics for previous training run or pretrained network pickle.
 
     Examples:
@@ -126,59 +130,72 @@ def calc_metrics(ctx, network_pkl, metrics, data, mirror, gpus, verbose):
       pr50k3       Precision and recall against 50k real images.
       is50k        Inception score for CIFAR-10.
     """
+
     dnnlib.util.Logger(should_flush=True)
-
-    # Validate arguments.
-    args = dnnlib.EasyDict(metrics=metrics, num_gpus=gpus, network_pkl=network_pkl, verbose=verbose)
-    if not all(metric_main.is_valid_metric(metric) for metric in args.metrics):
-        ctx.fail('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
-    if not args.num_gpus >= 1:
-        ctx.fail('--gpus must be at least 1')
-
-    # Load network.
-    if not dnnlib.util.is_url(network_pkl, allow_file_urls=True) and not os.path.isfile(network_pkl):
-        ctx.fail('--network must point to a file or URL')
-    if args.verbose:
-        print(f'Loading network from "{network_pkl}"...')
-    with dnnlib.util.open_url(network_pkl, verbose=args.verbose) as f:
-        network_dict = legacy.load_network_pkl(f)
-        args.G = network_dict['G_ema'] # subclass of torch.nn.Module
-
-    # Initialize dataset options.
-    if data is not None:
-        args.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data)
-    elif network_dict['training_set_kwargs'] is not None:
-        args.dataset_kwargs = dnnlib.EasyDict(network_dict['training_set_kwargs'])
+    if os.path.isdir(network_path):
+        network_pkl_list = glob(f'{network_path}/*.pkl')[1:]
+        if len(network_pkl_list) == 0:
+            ctx.fail('\n', f"no pkl files in DIR: {network_path}")
     else:
-        ctx.fail('Could not look up dataset options; please specify --data')
+        network_pkl_list = [network_path]
 
-    # Finalize dataset options.
-    args.dataset_kwargs.resolution = args.G.img_resolution
-    args.dataset_kwargs.use_labels = (args.G.c_dim != 0)
-    if mirror is not None:
-        args.dataset_kwargs.xflip = mirror
+    for network_pkl in network_pkl_list:
+        # Validate arguments.
+        args = dnnlib.EasyDict(metrics=metrics, num_gpus=gpus, network_pkl=network_pkl, verbose=verbose)
+        if not all(metric_main.is_valid_metric(metric) for metric in args.metrics):
+            ctx.fail('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
+        if not args.num_gpus >= 1:
+            ctx.fail('--gpus must be at least 1')
 
-    # Print dataset options.
-    if args.verbose:
-        print('Dataset options:')
-        print(json.dumps(args.dataset_kwargs, indent=2))
+        # Load network.
+        if not dnnlib.util.is_url(network_pkl, allow_file_urls=True) and not os.path.isfile(network_pkl):
+            ctx.fail('--network must point to a file or URL')
+        if args.verbose:
+            print(f'Loading network from "{network_pkl}"...')
+        with dnnlib.util.open_url(network_pkl, verbose=args.verbose) as f:
+            network_dict = legacy.load_network_pkl(f)
+            G = network_dict['G_ema'] # subclass of torch.nn.Module
 
-    # Locate run dir.
-    args.run_dir = None
-    if os.path.isfile(network_pkl):
-        pkl_dir = os.path.dirname(network_pkl)
-        if os.path.isfile(os.path.join(pkl_dir, 'training_options.json')):
-            args.run_dir = pkl_dir
-
-    # Launch processes.
-    if args.verbose:
-        print('Launching processes...')
-    torch.multiprocessing.set_start_method('spawn')
-    with tempfile.TemporaryDirectory() as temp_dir:
-        if args.num_gpus == 1:
-            subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
+        # Initialize dataset options.
+        if data is not None:
+            args.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data)
+        elif network_dict['training_set_kwargs'] is not None:
+            args.dataset_kwargs = dnnlib.EasyDict(network_dict['training_set_kwargs'])
         else:
-            torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
+            ctx.fail('Could not look up dataset options; please specify --data')
+
+        # Finalize dataset options.
+        if hasattr(G, 'img_resolution'):
+            args.dataset_kwargs.resolution = G.img_resolution
+        else:
+            args.dataset_kwargs.resolution = G.target_resolutions[-1]
+
+        args.dataset_kwargs.use_labels = (G.c_dim != 0)
+        if mirror is not None:
+            args.dataset_kwargs.xflip = mirror
+        del G
+
+        # Print dataset options.
+        if args.verbose:
+            print('Dataset options:')
+            print(json.dumps(args.dataset_kwargs, indent=2))
+
+        # Locate run dir.
+        args.run_dir = None
+        if os.path.isfile(network_pkl):
+            pkl_dir = os.path.dirname(network_pkl)
+            if os.path.isfile(os.path.join(pkl_dir, 'training_options.yml')):
+                args.run_dir = pkl_dir
+
+        # Launch processes.
+        if args.verbose:
+            print('Launching processes...')
+        torch.multiprocessing.set_start_method('spawn')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            if args.num_gpus == 1:
+                subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
+            else:
+                torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
 
 #----------------------------------------------------------------------------
 
