@@ -1,5 +1,6 @@
 G_kwargs:
-  class_name: 'training.networks_SPG_stylegan3.Generator'
+  class_name: 'training.networks_SPG_stylegan3_15.Generator'
+  # alpha_schedule: 1.0
   alpha_schedule:
     inline: 'lambda x,y : 1 / y'
     x: 'batch_size'
@@ -9,30 +10,35 @@ G_kwargs:
     x: 'batch_size'
   num_layers: 14
   num_critical: 2
+  # img_resolution: 128
 
-# G_opt_kwargs:
+G_opt_kwargs:
 #   class_name: 'torch.optim.SGD'
-  # lr: 0.01
+  lr: 0.001
 #   momentum: 0.9
 #   replace: True
 
 D_kwargs:
-  class_name: 'training.networks_SPG_stylegan3.Discriminator'
+  class_name: 'training.networks_SPG_stylegan3_15.Discriminator'
+  # alpha_schedule: 1.0
   alpha_schedule:
     inline: 'lambda x,y : 1 / y'
     x: 'batch_size'
     y: 'loop_kwargs.alpha_kimg' 
 
-# D_opt_kwargs:
+D_opt_kwargs:
 #   class_name: 'torch.optim.SGD'
-  # lr: 0.01
+  lr: 0.0007
 #   momentum: 0.9
 #   replace: True
 
 data:
-  resolution: [32, 64, 128, 256, 512]
+  resolution: [128]
   max_batch : 64
 
 loop_kwargs:
   class_name: 'training.training_loop.ProgressiveTrainer'
   alpha_kimg: 200000 # 600K images 
+
+# loss_kwargs:
+#   class_name: 'training.loss_shuffle.StyleGAN2Loss'

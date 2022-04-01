@@ -138,6 +138,7 @@ _C.loop_kwargs.ema_rampup               = 0.05
 _C.loop_kwargs.ada_kimg                 = 100
 _C.loop_kwargs.image_snapshot_ticks     = 20
 _C.loop_kwargs.network_snapshot_ticks   = 20
+_C.loop_kwargs.hist_snapshot_ticks      = 10
 _C.loop_kwargs.total_kimg               = 25000
 _C.loop_kwargs.D_reg_interval           = 16
 _C.loop_kwargs.kimg_per_tick            = 4

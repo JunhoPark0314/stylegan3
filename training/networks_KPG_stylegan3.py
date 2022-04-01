@@ -539,7 +539,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		sampling_rate,
 		bandlimit = None,
 		freq_dim = 64,
-		butterN = 3,
+		butterN = 1,
 		trainable_f = False,
 		layer_idx = None,
 		style_dim = 32,
@@ -614,7 +614,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		max_filter = (1 / (1 + (freq_norm / self.bandlimit) ** (2 * self.butterN)))
 
 		curr_filter = (high_filter * low_filter)
-		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * max_filter.square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
+		ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2) * curr_filter[:1].square().mean(dim=-1, keepdim=True).rsqrt()).unsqueeze(0)
 		# ix = ix * (curr_filter.unsqueeze(1).unsqueeze(2)).unsqueeze(0)
 
 		if style is not None:
@@ -1040,6 +1040,7 @@ class SynthesisLayer(torch.nn.Module):
 			max_sampling_rate = None
 			for sampling_rate, max_res in zip(self.target_sr[::-1], target_sr_res[::-1]):
 				if self.in_sampling_rate[res] < sampling_rate:
+					max_sampling_rate = sampling_rate
 					continue
 
 				up_filter_name = None,
@@ -1138,8 +1139,8 @@ class SynthesisLayer(torch.nn.Module):
 			dtype = torch.float16 if (path_args.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
 			# curr_alpha = alpha.item() if (len(self.paths[resolution]) > 1) and (path_id == len(self.paths[resolution]) - 1) else 1
-			# curr_alpha = alpha.item()  if path_args.use_alpha else 1
-			curr_alpha = 1
+			curr_alpha = alpha.item()  if path_args.use_alpha else 1
+			# curr_alpha = 1
 
 			# if noise_mode == "const":
 			# 	print(self.layer_idx, path_args.path, curr_alpha)

@@ -742,6 +742,7 @@ class Discriminator(torch.nn.Module):
         num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
         conv_clamp          = 256,      # Clamp the output of convolution layers to +-X, None = disable clamping.
         cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
+        conv_kernel         = 3,
         block_kwargs        = {},       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},       # Arguments for MappingNetwork.
         epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
