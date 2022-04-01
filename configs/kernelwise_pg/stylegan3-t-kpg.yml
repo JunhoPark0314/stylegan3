@@ -11,7 +11,7 @@ G_kwargs:
   num_critical: 2
 
 D_kwargs:
-  class_name: 'training.networks_KPG_stylegan3.Discriminator'
+  class_name: 'training.networks_LPG_stylegan3.Discriminator'
   alpha_schedule:
     inline: 'lambda x,y : 1 / y'
     x: 'batch_size'

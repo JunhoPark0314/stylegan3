@@ -365,6 +365,7 @@ class SynthesisLayer(torch.nn.Module):
         # Setup parameters and buffers.
         self.affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=1)
         self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, self.conv_kernel, self.conv_kernel]))
+        self.skip_weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, 1, 1]))
         self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
         self.register_buffer('magnitude_ema', torch.ones([]))
 
@@ -411,14 +412,26 @@ class SynthesisLayer(torch.nn.Module):
 
         # Execute modulated conv2d.
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
+
+        # skip_x = modulated_conv2d(x=x.to(dtype), w=self.skip_weight, s=styles,
+        #     padding=1, demodulate=False, input_gain=input_gain)
+        # skip_x = torch.nn.functional.pad(x, [1]*4)
         x = modulated_conv2d(x=x.to(dtype), w=self.weight, s=styles,
             padding=self.conv_kernel-1, demodulate=(not self.is_torgb), input_gain=input_gain)
+
+        # x = (x + skip_x) / np.sqrt(4)
 
         # Execute bias, filtered leaky ReLU, and clamping.
         gain = 1 if self.is_torgb else np.sqrt(2)
         slope = 1 if self.is_torgb else 0.2
         x = filtered_lrelu.filtered_lrelu(x=x, fu=self.up_filter, fd=self.down_filter, b=self.bias.to(x.dtype),
             up=self.up_factor, down=self.down_factor, padding=self.padding, gain=gain, slope=slope, clamp=self.conv_clamp)
+
+        # x = bias_act.bias_act(x, b=self.bias.to(x.dtype), act="lrelu", gain=gain, alpha=slope)
+        # x = torch.nn.functional.interpolate(x, scale_factor=2)
+        # if self.up_factor == 4:
+        #     x = torch.nn.functional.pad(x, pad=[-2]*4)
+        # x = torch.nn.functional.interpolate(x, size=[int(self.out_size[1]), int(self.out_size[0])], mode='bilinear')
 
         # Ensure correct shape and dtype.
         misc.assert_shape(x, [None, self.out_channels, int(self.out_size[1]), int(self.out_size[0])])
@@ -842,6 +855,7 @@ class DiscriminatorBlock(torch.nn.Module):
         fp16_channels_last  = False,        # Use channels-last memory format with FP16?
         freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
         frgb                = False,        # For layers which need fromRGB during progressive training
+        conv_kernel         = 3, 
     ):
         assert in_channels in [0, tmp_channels]
         assert architecture in ['orig', 'skip', 'resnet']
@@ -1038,6 +1052,7 @@ class Discriminator(torch.nn.Module):
         conv_clamp          = 256,      # Clamp the output of convolution layers to +-X, None = disable clamping.
         cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
         alpha_schedule      = 1e-5,     # Schedule rate for alpha
+        conv_kernel         = 3,
         block_kwargs        = {},       # Arguments for DiscriminatorBlock.
         mapping_kwargs      = {},       # Arguments for MappingNetwork.
         epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
@@ -1071,7 +1086,7 @@ class Discriminator(torch.nn.Module):
             use_fp16 = (res >= fp16_resolution)
             frgb = res >= self.target_resolution
             block = DiscriminatorBlock(in_channels, tmp_channels, out_channels, resolution=res,
-                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, frgb=frgb, **block_kwargs, **common_kwargs)
+                first_layer_idx=cur_layer_idx, use_fp16=use_fp16, frgb=frgb, conv_kernel=conv_kernel, **block_kwargs, **common_kwargs)
             setattr(self, f'b{res}', block)
             cur_layer_idx += block.num_layers
         if c_dim > 0:

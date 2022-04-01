@@ -30,7 +30,7 @@ D_kwargs:
 #   replace: True
 
 data:
-  resolution: [32, 64, 128, 256, 512]
+  resolution: [128]
   max_batch : 64
 
 loop_kwargs:

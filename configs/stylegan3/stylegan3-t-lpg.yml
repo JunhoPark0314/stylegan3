@@ -10,7 +10,7 @@ G_kwargs:
   num_layers: 14
   num_critical: 0
   
-  first_stopband: 2.4622888 # 2 ** 1.3
+  # first_stopband: 2.4622888 # 2 ** 1.3
 
 D_kwargs:
   class_name: 'training.networks_LPG_stylegan3.Discriminator'
@@ -20,8 +20,8 @@ D_kwargs:
     y: 'loop_kwargs.alpha_kimg' 
 
 data:
-  resolution: [32, 64, 128, 256, 512]
+  resolution: [32, 64, 128]
 
 loop_kwargs:
   class_name: 'training.training_loop.ProgressiveTrainer'
-  alpha_kimg: 300000 # 300K images 
+  alpha_kimg: 600000 # 300K images 
