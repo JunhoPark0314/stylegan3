@@ -569,10 +569,10 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
 		if self.layer_idx is not None:
-			self.pe_dim = int(np.ceil(np.log2(self.bandlimit))) + 2
+			self.pe_dim = int(np.ceil(np.log2(self.bandlimit))) + 3
 			self.style_mag = FullyConnectedLayer(in_features=w_dim, out_features=self.pe_dim, bias_init=[0] * (self.pe_dim-1) + [1], weight_init=0.1)
 			pe_base = torch.arange(start=0,end=self.pe_dim-1).exp2().pow(-1)
-			self.register_buffer("pe_base", pe_base.view(1,1,-1))
+			self.register_buffer("pe_base", pe_base.view(1,1,-1, 1))
 			self.register_buffer("style_bias", torch.ones([in_channels, self.freq_dim, 1]))
 
 		if False:
@@ -609,7 +609,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		freq_weight = self.freq_weight
 		if style is not None:
 			style_weight = self.style_mag(style)
-			style_emb = (in_phases.unsqueeze(-1) * self.pe_base * np.pi * 2).sin()
+			style_emb = (in_freqs.unsqueeze(-2) * self.pe_base * np.pi * 2).sum(dim=-1).sin()
 			style_emb = torch.cat([style_emb, self.style_bias], dim=-1)
 			freq_style = torch.einsum('ifp,bp->bif',style_emb, style_weight)
 			freq_weight = freq_weight.unsqueeze(0) * freq_style
