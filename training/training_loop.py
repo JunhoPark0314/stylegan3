@@ -8,6 +8,7 @@
 
 """Main training loop."""
 
+from collections import defaultdict
 import os
 import time
 import copy
@@ -60,6 +61,7 @@ class BaseTrainer:
 		ada_kimg=500,
 		image_snapshot_ticks=50,
 		network_snapshot_ticks=50,
+		hist_snapshot_ticks=10,
 		total_kimg=25000,
 		G_reg_interval=None,
 		D_reg_interval=16,
@@ -203,7 +205,8 @@ class BaseTrainer:
 			phases=self.phases, 
 			run_dir=cfg.run_dir, 
 			rank=rank,
-			metrics=cfg.metrics)
+			metrics=cfg.metrics,
+			hist_snapshot_ticks=hist_snapshot_ticks)
 		self.checkpointer = Checkpointer(
 			run_dir=cfg.run_dir,
 			G_ema=self.G_ema,
@@ -292,7 +295,7 @@ class BaseTrainer:
 			self.snap_res = self.dataloader.cur_res
 			batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
 			gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 4)
-			gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 7)
+			gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 3, 3)
 			self.grid_size = (gw, gh)
 			self.grid_z = torch.cat(self.grid_z)[:gw*gh].split(batch_gpu)
 			self.grid_c = torch.cat(self.grid_c)[:gw*gh].split(batch_gpu)
@@ -304,7 +307,7 @@ class BaseTrainer:
 
 			rnd = np.random.RandomState(self.seed)
 			gw = np.clip(1080 // self.dataloader.cur_trainset.image_shape[1], 4, 4)
-			gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 7, 7)
+			gh = np.clip(1920 // self.dataloader.cur_trainset.image_shape[2], 3, 3)
 
 			# No labels => show random subset of training samples.
 			if not training_set.has_labels:
@@ -369,7 +372,7 @@ class BaseTrainer:
 				print('Aborting...')
 
 		grid_size, grid_z, grid_c, _ = self.setup_snapshot_image_grid()
-		self.checkpointer.save_image(progress_info, grid_z, grid_c, grid_size)
+		self.checkpointer.save_image(progress_info, grid_z, grid_c, grid_size, self.D.curr_resolution)
 		snap_progress = EasyDict(
 			cur_tick=self.pg_info.cur_tick,
 			cur_nimg=self.pg_info.cur_nimg,
@@ -379,8 +382,8 @@ class BaseTrainer:
 		)
 		snapshot_data = dict(G=self.G, D=self.D, G_ema=self.G_ema, augment_pipe=self.augment_pipe, #training_set_kwargs=dict(dataloader.cur_trainset_kwargs))
 						progress_info=snap_progress)
+		self.logger.update_hist(snapshot_data, progress_info)
 		snapshot_pkl, snapshot_data = self.checkpointer.save_pkl(progress_info, snapshot_data)
-
 		self.logger.update_metric(snapshot_pkl, snapshot_data, progress_info)
 
 		if snapshot_data:
@@ -411,6 +414,8 @@ class BaseTrainer:
 			- device            : Current device id used in training
 		"""
 		batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
+		curr_batch = batch_size
+		# curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 4) * 4
 		G = self.G
 		G_ema = self.G_ema
 
@@ -424,9 +429,12 @@ class BaseTrainer:
 				p_ema.copy_(p.lerp(p_ema, ema_beta))
 			for b_ema, b in zip(G_ema.buffers(), G.buffers()):
 				b_ema.copy_(b)
+			if hasattr(G_ema, 'freq_parameters'):
+				for p_ema, p in zip(G_ema.freq_parameters(), G.freq_parameters()):
+					p_ema.copy_(p)
 
 		# Update state.
-		progress_info.cur_nimg += batch_size
+		progress_info.cur_nimg += curr_batch
 		progress_info.batch_idx += 1
 
 		# Execute ADA heuristic.
@@ -477,12 +485,6 @@ class BaseTrainer:
 			phase.opt.zero_grad(set_to_none=True)
 			phase.module.requires_grad_(True)
 			for real_img, real_c, gen_z, gen_c in zip(phase_real_img, phase_real_c, phase_gen_z, phase_gen_c):
-				if 'D' in phase['name']:
-					curr_batch = max(int(batch_gpu * (0.2 + self.D.alpha.item())/(1.2))//4, 1) * 4
-					real_img = real_img[:curr_batch]
-					real_c = real_c[:curr_batch]
-					gen_z = gen_z[:curr_batch]
-					gen_c = gen_c[:curr_batch]
 				loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c, gain=phase.interval, cur_nimg=cur_nimg)
 			phase.module.requires_grad_(False)
 
@@ -539,7 +541,7 @@ class ProgressiveTrainer(BaseTrainer):
 	):
 		super().update_per_batch(progress_info)
 		batch_size, batch_gpu, ema_kimg = self.dataloader.get_hyper_params()
-		cur_alpha = torch.ones([]) * (batch_size / self.alpha_kimg)
+		cur_alpha = torch.ones([]) * (batch_size/ self.alpha_kimg)
 		self.G.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
 		self.D.alpha.copy_(torch.clip(self.D.alpha + cur_alpha, min=0, max=1))
 		self.G_ema.synthesis.alpha.copy_(torch.clip(self.G.synthesis.alpha + cur_alpha, min=0, max=1))
@@ -551,6 +553,7 @@ class Logger:
 		run_dir,
 		rank,
 		metrics,
+		hist_snapshot_ticks = 1,
 	):
 		self.timer = Timer()
 		self.phases = phases
@@ -559,6 +562,8 @@ class Logger:
 		self.stats_metrics = {}
 		self.stats_jsonl = None
 		self.stats_tfevents = None
+		self.stats_hist = {}
+		self.hist_snapshot_ticks = hist_snapshot_ticks
 		self.metrics = metrics
 		if rank == 0:
 			self.stats_jsonl = open(os.path.join(self.run_dir, 'stats.jsonl'), 'wt')
@@ -621,6 +626,38 @@ class Logger:
 					metric_main.report_metric(result_dict, run_dir=self.run_dir, snapshot_pkl=snapshot_pkl)
 				self.stats_metrics.update(result_dict.results)
 	
+	def update_hist(
+		self,
+		snapshot_data,
+		progress_info,
+	):
+		if snapshot_data == None:
+			return
+
+		done = progress_info.done
+		cur_tick = progress_info.cur_tick
+		if (self.hist_snapshot_ticks is not None) and (done or cur_tick % self.hist_snapshot_ticks == 0):
+			G_ema = snapshot_data['G_ema']
+			for name in G_ema.synthesis.layer_names:
+				layer = getattr(G_ema.synthesis, name)
+				if hasattr(layer, 'weight_gen'):
+					freq = layer.weight_gen.get_freqs().norm(dim=-1)
+					self.stats_hist[f'G_{name}_freq'] = freq.flatten().cpu()
+					self.stats_hist[f'G_{name}_mag'] = layer.weight_gen.freq_weight.data.flatten().cpu()
+					self.stats_hist[f'G_{name}_phase'] = layer.weight_gen.phases.data.flatten().cpu()
+			
+			D = snapshot_data['D']
+			for res in D.block_resolutions:
+				block = getattr(D, f'b{res}')
+				if hasattr(block, 'conv0_weight'):
+					freq = block.conv0_weight.get_freqs().norm(dim=-1)
+					self.stats_hist[f'D_b{res}_conv0_freq'] = freq.flatten().cpu()
+					freq = block.conv1_weight.get_freqs().norm(dim=-1)
+					self.stats_hist[f'D_b{res}_conv1_freq'] = freq.flatten().cpu()
+			if hasattr(D.b4, 'weight_gen'):
+				Freq = D.b4.weight_gen.get_freqs().norm(dim=-1)
+				self.stats_hist[f'D_b4_freq'] = freq.flatten().cpu()
+	
 	def write_log(self, progress_info):
 		cur_nimg = progress_info.cur_nimg
 		# Collect statistics.
@@ -647,6 +684,10 @@ class Logger:
 				self.stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
 			for name, value in self.stats_metrics.items():
 				self.stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
+			for name, value in self.stats_hist.items():
+				self.stats_tfevents.add_histogram(f'Hist/{name}', value, global_step=global_step, walltime=walltime)
+			
+			self.stats_hist = {}
 			self.stats_tfevents.flush()
 
 class Timer:
@@ -690,6 +731,7 @@ class Checkpointer:
 		self.network_snapshot_ticks = network_snapshot_ticks
 		self.run_dir = run_dir
 		self.G_ema = G_ema
+		self.interest_layer = self.G_ema.synthesis.layer_names[1::4]
 
 	def save_image(
 		self, 
@@ -697,6 +739,7 @@ class Checkpointer:
 		grid_z,
 		grid_c,
 		grid_size,
+		curr_res=None,
 	):
 		done = progress_info.done
 		cur_nimg = progress_info.cur_nimg
@@ -706,11 +749,35 @@ class Checkpointer:
 		# Save image snapshot.
 		if (rank == 0) and (self.image_snapshot_ticks is not None) and (done or cur_tick % self.image_snapshot_ticks == 0):
 			# target_resolutions = self.G_ema.target_resolutions
-			# for res in target_resolutions:
-			# 	self.G_ema.set_resolution(res)
-			res = self.G_ema.synthesis.curr_resolution
-			images = torch.cat([self.G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
-			save_image_grid(images, os.path.join(self.run_dir, f'fakes_{cur_nimg//1000:06d}_{res}.png'), drange=[-1,1], grid_size=grid_size)
+			# res = self.G_ema.synthesis.curr_resolution
+			min_res = max(curr_res//2, 128)
+			max_res = min(curr_res * 2, 128)
+			target_resolutions = list(set([min_res, curr_res, max_res]))
+			for res in target_resolutions:
+				image_grid_dict = defaultdict(list)
+				self.G_ema.set_resolution(res)
+				for z, c in zip(grid_z, grid_c):
+					ws = self.G_ema.mapping(z, c)
+					ws = ws.to(torch.float32).unbind(dim=1)
+					x = self.G_ema.synthesis.input(ws[0], resolution=self.G_ema.synthesis.curr_resolution)
+					image_grid_dict['input'].append(x)
+					for name, w, in zip(self.G_ema.synthesis.layer_names, ws[1:]):
+						x = getattr(self.G_ema.synthesis, name)(x, w, resolution=self.G_ema.synthesis.curr_resolution, alpha=self.G_ema.synthesis.alpha, noise_mode="const")
+						if name in self.interest_layer:
+							image_grid_dict[name].append(x)
+					
+					x = x * self.G_ema.synthesis.output_scale
+					image_grid_dict['image'].append(x.to(torch.float32))
+				
+				for k, v in image_grid_dict.items():
+					images = torch.cat(v).cpu().numpy()
+					drange = [-1, 1] if k =='image' else [images.max() * np.sqrt(2), images.min() * np.sqrt(2)]
+					save_image_grid(images[:,:3,...], os.path.join(self.run_dir, f'0fakes_{cur_nimg//1000:06d}_{k}.png'), drange=drange, grid_size=grid_size)
+				
+				del image_grid_dict
+				
+				# images = torch.cat([self.G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
+				# save_image_grid(images, os.path.join(self.run_dir, f'fakes_{cur_nimg//1000:06d}_{res}.png'), drange=[-1,1], grid_size=grid_size)
 
 	def save_pkl(
 		self, 

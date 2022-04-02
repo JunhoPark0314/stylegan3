@@ -18,9 +18,13 @@ D_kwargs:
     y: 'loop_kwargs.alpha_kimg' 
 
 data:
+  # resolution: [32, 64, 128, 256, 512]
   resolution: [32, 64, 128, 256, 512]
   max_batch : 16
 
 loop_kwargs:
   class_name: 'training.training_loop.ProgressiveTrainer'
-  alpha_kimg: 200000 # 600K images 
+  alpha_kimg: 200000
+  # alpha_kimg:
+  #   inline: 'lambda x: 600_000 * x' # 600K images 
+  #   x: 'batch_size'
