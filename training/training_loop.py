@@ -12,7 +12,7 @@ import os
 import time
 import copy
 import json
-import pickle
+import dill as pickle
 import psutil
 import PIL.Image
 import numpy as np

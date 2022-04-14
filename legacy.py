@@ -9,7 +9,7 @@
 """Converting legacy network pickle into the new format."""
 
 import click
-import pickle
+import dill as pickle
 import re
 import copy
 import numpy as np

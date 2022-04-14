@@ -251,7 +251,7 @@ def main(**kwargs):
             c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
             c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
         if opts.cfg == 'stylegan3-s':
-            c.D_kwargs.class_name = 'training.nteworks_stylegan3_synth.Discriminator'
+            c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
 
 
     # Augmentation.

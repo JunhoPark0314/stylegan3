@@ -195,12 +195,12 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 
 		# Draw random frequencies from uniform 2D disc.
-		freqs = torch.randn([self.freq_dim, 2])
-		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
+		freqs = torch.randn([self.in_channels, self.freq_dim, 2])
+		radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
 		freqs /= radii * radii.square().exp().pow(0.25)
 		freqs *= self.bandwidth
-		radii = freqs.square().sum(dim=1, keepdim=True).sqrt()
-		phases = torch.rand([self.freq_dim]) - 0.5
+		radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
+		phases = torch.rand([self.in_channels, self.freq_dim]) - 0.5
 
 		self.register_buffer("radii", radii)
 		self.freqs = torch.nn.Parameter(freqs)
@@ -210,11 +210,11 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.freq_out = torch.nn.Parameter(torch.randn([out_channels, self.freq_dim]))
 		self.weight_bias = torch.nn.Parameter(torch.randn([out_channels, in_channels, 1, 1]))
 
-		self.gain = lambda x: 1 if self.layer_idx is not None else np.sqrt(1 / (in_channels * (x ** 2)))
+		self.gain = lambda x: np.sqrt(1 / (in_channels * (x ** 2)))
 
 
 	def get_freqs(self):
-		radii = self.freqs.square().sum(dim=1, keepdim=True).sqrt()
+		radii = self.freqs.square().sum(dim=-1, keepdim=True).sqrt()
 		return self.freqs / radii * self.radii
 
 	def forward(self, device, ks, alpha=1, update_emas=False, style=None):
@@ -236,7 +236,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		kernel = torch.einsum('bihwf,bif,of->boihw', ix, in_mag, out_mag) * np.sqrt(1 / (self.freq_dim * 2))
 		kernel = kernel + self.weight_bias * np.sqrt(1 / (2 * ks))
 
-		kernel = kernel.squeeez(0) * self.gain(ks)
+		kernel = kernel.squeeze(0) * self.gain(ks)
 
 		return kernel
 
@@ -300,8 +300,6 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.conv0_bias = torch.nn.Parameter(torch.zeros([tmp_channels]))
 		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, sampling_rate=self.resolution)
 		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
-
-		self.pe_grid = SynthesisGroupKernel(tmp_channels, 1, sampling_rate=self.resolution, layer_idx=-1)
 
 		self.conv0_padding = {}
 		self.conv1_padding = {}
