@@ -30,8 +30,8 @@ from metrics import metric_main
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
     rnd = np.random.RandomState(random_seed)
-    gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
-    gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
+    gw = np.clip(7680 // training_set.image_shape[2], 4, 4)
+    gh = np.clip(4320 // training_set.image_shape[1], 4, 4)
 
     # No labels => show random subset of training samples.
     if not training_set.has_labels:
