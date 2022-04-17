@@ -664,7 +664,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.sampling_rate = sampling_rate
 		self.cutoff = cutoff * 2 if cutoff is not None else sampling_rate
 		self.bandwidth = self.sampling_rate * (2 ** 0.3) #* (2 ** -0.9)
-		self.freq_dim = np.clip(self.sampling_rate * 4, a_min=256, a_max=2048)
+		self.freq_dim = np.clip(self.sampling_rate * 4, a_min=512, a_max=4096)
 
 
 		# Draw random frequencies from uniform 2D disc.
