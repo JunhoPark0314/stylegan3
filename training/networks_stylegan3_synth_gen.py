@@ -176,7 +176,6 @@ class SynthesisInput(torch.nn.Module):
 		size,           # Output spatial size: int or [width, height].
 		sampling_rate,  # Output sampling rate.
 		bandwidth,      # Output bandwidth.
-		trainable_phase,
 	):
 		super().__init__()
 		self.w_dim = w_dim
@@ -197,10 +196,7 @@ class SynthesisInput(torch.nn.Module):
 		self.affine = FullyConnectedLayer(w_dim, 4, weight_init=0, bias_init=[1,0,0,0])
 		self.register_buffer('transform', torch.eye(3, 3)) # User-specified inverse transform wrt. resulting image.
 		self.register_buffer('freqs', freqs)
-		if trainable_phase:
-			self.phases = torch.nn.Parameter(phases)
-		else:
-			self.register_buffer('phases', phases)
+		self.register_buffer('phases', phases)
 
 	def forward(self, w):
 		# Introduce batch dimension.
@@ -510,7 +506,6 @@ class SynthesisNetwork(torch.nn.Module):
 		margin_size         = 10,       # Number of additional pixels outside the image.
 		output_scale        = 0.25,     # Scale factor for the output image.
 		num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
-		trainable_phase     = False,
 		**layer_kwargs,                 # Arguments for SynthesisLayer.
 	):
 		super().__init__()
@@ -542,7 +537,7 @@ class SynthesisNetwork(torch.nn.Module):
 		# Construct layers.
 		self.input = SynthesisInput(
 			w_dim=self.w_dim, channels=int(channels[0]), size=int(sizes[0]),
-			sampling_rate=sampling_rates[0], bandwidth=cutoffs[0], trainable_phase=trainable_phase)
+			sampling_rate=sampling_rates[0], bandwidth=cutoffs[0])
 		self.layer_names = []
 		self.num_trgb = int(np.log2(self.img_resolution))
 		self.to_rgb_layers = defaultdict(dict)
