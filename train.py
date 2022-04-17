@@ -125,7 +125,7 @@ def parse_comma_separated_list(s):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-s']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-s', 'stylegan3-sblur']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -216,7 +216,7 @@ def main(**kwargs):
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
-    c.image_snapshot_ticks = opts.snap // 10
+    c.image_snapshot_ticks = 1
     c.network_snapshot_ticks = opts.snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
@@ -252,6 +252,15 @@ def main(**kwargs):
             c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
         if opts.cfg == 'stylegan3-s':
             c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
+            c.G_kwargs.class_name = 'training.networks_stylegan3_synth_gen.Generator'
+            # c.D_opt_kwargs.betas = [0.9, 0.99]
+            # c.G_kwargs.trainable_phase = True
+        if opts.cfg == 'stylegan3-sblur':
+            c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
+            c.G_kwargs.class_name = 'training.networks_stylegan3_synth_gen.Generator'
+            c.G_kwargs.trainable_phase = True
+            c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
+            c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
 
 
     # Augmentation.
