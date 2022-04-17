@@ -306,8 +306,8 @@ class SynthesisLayer(torch.nn.Module):
 
 		# Setup parameters and buffers.
 		self.affine = FullyConnectedLayer(self.w_dim, self.in_channels, bias_init=1)
-		self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, self.conv_kernel, self.conv_kernel]))
-		# self.weight_gen = SynthesisGroupKernel(in_channels=self.in_channels, out_channels=self.out_channels, sampling_rate=self.in_sampling_rate)
+		# self.weight = torch.nn.Parameter(torch.randn([self.out_channels, self.in_channels, self.conv_kernel, self.conv_kernel]))
+		self.weight_gen = SynthesisGroupKernel(in_channels=self.in_channels, out_channels=self.out_channels, sampling_rate=self.in_sampling_rate)
 		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
 		self.register_buffer('magnitude_ema', torch.ones([]))
 
@@ -355,8 +355,7 @@ class SynthesisLayer(torch.nn.Module):
 
 		# Execute modulated conv2d.
 		dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
-		# weight = self.weight_gen(device = x.device, ks=1 if self.is_torgb else 3).to(dtype)
-		weight = self.weight
+		weight = self.weight_gen(device = x.device, ks=1 if self.is_torgb else 3).to(dtype)
 		x = modulated_conv2d(x=x.to(dtype), w=weight, s=styles,
 			padding=self.conv_kernel-1, demodulate=(not self.is_torgb), input_gain=input_gain)
 
@@ -431,8 +430,8 @@ class ToRGBLayer(torch.nn.Module):
 		self.conv_clamp = conv_clamp
 		self.affine = FullyConnectedLayer(w_dim, in_channels, bias_init=1)
 		memory_format = torch.channels_last if channels_last else torch.contiguous_format
-		# self.weight_gen = SynthesisGroupKernel(in_channels=in_channels, out_channels=out_channels, sampling_rate=sampling_rate)
-		self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format))
+		self.weight_gen = SynthesisGroupKernel(in_channels=in_channels, out_channels=out_channels, sampling_rate=sampling_rate)
+		# self.weight = torch.nn.Parameter(torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format))
 		self.bias = torch.nn.Parameter(torch.zeros([out_channels]))
 		self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
 		self.up_factor = img_resolution // sampling_rate
@@ -475,8 +474,7 @@ class ToRGBLayer(torch.nn.Module):
 
 	def forward(self, x, w, fused_modconv=True):
 		styles = self.affine(w) * self.weight_gain
-		# weight = self.weight_gen(device=x.device, ks=1)
-		weight = self.weight
+		weight = self.weight_gen(device=x.device, ks=1)
 		x = modulated_conv2d(x=x, w=weight, s=styles, demodulate=False, padding=0)
 		x = bias_act.bias_act(x, self.bias.to(x.dtype), clamp=self.conv_clamp)
 		# High pass filter	
