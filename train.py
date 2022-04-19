@@ -121,6 +121,11 @@ def parse_comma_separated_list(s):
 
 #----------------------------------------------------------------------------
 
+def get_dist_from_file(file_path):
+    return None
+
+#----------------------------------------------------------------------------
+
 @click.command()
 
 # Required.
@@ -148,6 +153,10 @@ def parse_comma_separated_list(s):
 @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
 @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
 @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
+@click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['uniform', 'low_biased', 'high_biased', 'data-driven']), default="uniform", show_default=True)
+@click.option('--max-freq',     help='Maximum frequency dimension', metavar='INT',              type=click.IntRange(min=64), default=512, show_default=True)
+@click.option('--sort-dist',    help='Sort frequency set when initialize', metavar='BOOL',      type=bool, default=True, show_default=True)
+
 
 # Misc settings.
 @click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
@@ -250,13 +259,18 @@ def main(**kwargs):
             c.G_kwargs.use_radial_filters = True # Use radially symmetric downsampling filters.
             c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
             c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
-        if opts.cfg == 'stylegan3-s':
+        if 'stylegan3-fdpk' in opts.cfg:
             c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
-        if opts.cfg == 'stylegan3-sblur':
-            c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
-            c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
-            c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
-
+            c.D_kwargs.freq_dist = opts.freq_dist
+            c.D_kwargs.max_freq = opts.max_freq
+            c.D_kwargs.sort_dist = opts.sort_dist
+            if 'blur' in opts.cfg:
+                c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
+                c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
+            if opts.freq_dist == "data-driven":
+                raise("data driven init not implemented now")
+                assert opts.dist_init is not None
+                c.D_kwargs.dist_init = get_dist_from_file(opts.dist_init)
 
     # Augmentation.
     if opts.aug != 'noaug':

@@ -186,6 +186,8 @@ class SynthesisGroupKernel(torch.nn.Module):
 		sampling_rate = 16,
 		distribution = "sin", # "uniform / biased / data-driven / sin"
 		dist_init = None,
+		max_freq = 512,
+		sort_dist = True,
 	):
 		super().__init__()
 		self.in_channels = in_channels
@@ -193,7 +195,7 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.sampling_rate = sampling_rate
 		self.cutoff = cutoff * 2 if cutoff is not None else sampling_rate
 		self.bandwidth = self.sampling_rate * (2 ** 0.1) #* (2 ** -0.9)
-		self.freq_dim = np.clip(self.sampling_rate * 8, a_min=64, a_max=512)
+		self.freq_dim = np.clip(self.sampling_rate * 8, a_min=128, a_max=max_freq)
 
 		# Draw random frequencies from uniform 2D disc.
 		freqs = torch.randn([self.in_channels, self.freq_dim, 2])
@@ -201,15 +203,16 @@ class SynthesisGroupKernel(torch.nn.Module):
 		freqs /= radii
 		if distribution == "uniform":
 			dist = radii.square().exp().pow(-0.25)
-		elif distribution == "biased":
+		elif distribution == "low_biased":
 			dist = torch.rand([self.in_channels, self.freq_dim, 1])
-			dist = torch.sort(dist, dim=1)[0]	
-		elif distribution == "sin":
+		elif distribution == "high_biased":
 			dist = torch.randn([self.in_channels, self.freq_dim, 1]).sin()
-			dist = torch.sort(dist, dim=1)[0]
 		elif distribution == "data-driven":
 			assert dist_init is not None
 			dist = dist_init
+		
+		if sort_dist:
+			dist = torch.sort(dist, dim=1)[0]
 
 		freqs *= (self.bandwidth * dist)
 		phases = torch.rand([self.in_channels, self.freq_dim]) - 0.5
@@ -276,6 +279,10 @@ class DiscriminatorBlock(torch.nn.Module):
 		fp16_channels_last  = False,        # Use channels-last memory format with FP16?
 		freeze_layers       = 0,            # Freeze-D: Number of layers to freeze.
 		conv_kernel			= 3,
+		freq_dist			= 'uniform',
+		max_freq			= 512,
+		dist_init			= None,
+		sort_dist			= True,
 	):
 		assert in_channels in [0, tmp_channels]
 		assert architecture in ['orig', 'skip', 'resnet']
@@ -307,11 +314,14 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.activation = activation
 		self.act_gain = bias_act.activation_funcs[activation].def_gain
 
-		self.conv0_weight = SynthesisGroupKernel(tmp_channels, tmp_channels, sampling_rate=self.resolution)
+		self.conv0_weight = SynthesisGroupKernel(tmp_channels, tmp_channels, sampling_rate=self.resolution
+			,freq_dist=freq_dist, max_freq=max_freq, dist_init=dist_init, sort_dist=sort_dist)
 		self.conv0_bias = torch.nn.Parameter(torch.zeros([tmp_channels]))
-		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, sampling_rate=self.resolution)
+		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, sampling_rate=self.resolution
+			,freq_dist=freq_dist, max_freq=max_freq, dist_init=dist_init, sort_dist=sort_dist)
 		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
-		self.skip_weight = SynthesisGroupKernel(tmp_channels, out_channels, sampling_rate=self.resolution)
+		self.skip_weight = SynthesisGroupKernel(tmp_channels, out_channels, sampling_rate=self.resolution
+			,freq_dist=freq_dist, max_freq=max_freq, dist_init=dist_init, sort_dist=sort_dist)
 
 		# if architecture == 'resnet':
 		# 	self.skip = Conv2dLayer(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
@@ -440,6 +450,10 @@ class DiscriminatorEpilogue(torch.nn.Module):
 		activation          = 'lrelu',  # Activation function: 'relu', 'lrelu', etc.
 		conv_clamp          = None,     # Clamp the output of convolution layers to +-X, None = disable clamping.
 		resample_filter		= [1, 3, 3, 1],
+		freq_dist			= 'uniform',
+		max_freq			= 512,
+		dist_init			= None,
+		sort_dist			= True,
 	):
 		assert architecture in ['orig', 'skip', 'resnet']
 		super().__init__()
@@ -456,7 +470,8 @@ class DiscriminatorEpilogue(torch.nn.Module):
 			self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
 		self.mbstd = MinibatchStdLayer(group_size=mbstd_group_size, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
 
-		self.conv_weight = SynthesisGroupKernel(in_channels + mbstd_num_channels, in_channels, sampling_rate=self.resolution)
+		self.conv_weight = SynthesisGroupKernel(in_channels + mbstd_num_channels, in_channels, sampling_rate=self.resolution
+			,freq_dist=freq_dist, max_freq=max_freq, dist_init=dist_init, sort_dist=sort_dist)
 		self.conv_bias = torch.nn.Parameter(torch.zeros([in_channels]))
 
 		self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
@@ -510,6 +525,10 @@ class Discriminator(torch.nn.Module):
 		num_fp16_res        = 4,        # Use FP16 for the N highest resolutions.
 		conv_clamp          = 256,      # Clamp the output of convolution layers to +-X, None = disable clamping.
 		cmap_dim            = None,     # Dimensionality of mapped conditioning label, None = default.
+		freq_dist			= 'uniform',
+		max_freq			= 512,
+		dist_init			= None,
+		sort_dist			= True,
 		block_kwargs        = {},       # Arguments for DiscriminatorBlock.
 		mapping_kwargs      = {},       # Arguments for MappingNetwork.
 		epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
@@ -528,7 +547,8 @@ class Discriminator(torch.nn.Module):
 		if c_dim == 0:
 			cmap_dim = 0
 
-		common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp)
+		common_kwargs = dict(img_channels=img_channels, architecture=architecture, conv_clamp=conv_clamp,
+			freq_dist=freq_dist, max_freq=max_freq, dist_init=dist_init, sort_dist=sort_dist)
 		cur_layer_idx = 0
 		for res in self.block_resolutions:
 			in_channels = channels_dict[res] if res < img_resolution else 0
