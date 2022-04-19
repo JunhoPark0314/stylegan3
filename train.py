@@ -130,7 +130,7 @@ def get_dist_from_file(file_path):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-s', 'stylegan3-sblur']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-fdpk', 'stylegan3-fdpk-blur']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -154,7 +154,8 @@ def get_dist_from_file(file_path):
 @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
 @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
 @click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['uniform', 'low_biased', 'high_biased', 'data-driven']), default="uniform", show_default=True)
-@click.option('--max-freq',     help='Maximum frequency dimension', metavar='INT',              type=click.IntRange(min=64), default=512, show_default=True)
+@click.option('--fdim-base',    help='Frequency dimension scale factor', metavar='INT',         type=click.IntRange(min=1), default=8, show_default=True)
+@click.option('--fdim-max',     help='Maximum frequency dimension', metavar='INT',              type=click.IntRange(min=64), default=512, show_default=True)
 @click.option('--sort-dist',    help='Sort frequency set when initialize', metavar='BOOL',      type=bool, default=True, show_default=True)
 
 
@@ -262,7 +263,8 @@ def main(**kwargs):
         if 'stylegan3-fdpk' in opts.cfg:
             c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
             c.D_kwargs.freq_dist = opts.freq_dist
-            c.D_kwargs.max_freq = opts.max_freq
+            c.D_kwargs.fdim_base = opts.fdim_base
+            c.D_kwargs.fdim_max = opts.fdim_max
             c.D_kwargs.sort_dist = opts.sort_dist
             if 'blur' in opts.cfg:
                 c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
