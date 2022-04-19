@@ -252,12 +252,8 @@ def main(**kwargs):
             c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
         if opts.cfg == 'stylegan3-s':
             c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
-            c.G_kwargs.class_name = 'training.networks_stylegan3_synth_gen.Generator'
-            # c.D_opt_kwargs.betas = [0.9, 0.99]
-            # c.G_kwargs.trainable_phase = True
         if opts.cfg == 'stylegan3-sblur':
             c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
-            c.G_kwargs.class_name = 'training.networks_stylegan3_synth_gen.Generator'
             c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
             c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
 

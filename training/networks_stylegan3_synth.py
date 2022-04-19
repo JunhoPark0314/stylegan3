@@ -184,29 +184,37 @@ class SynthesisGroupKernel(torch.nn.Module):
 		out_channels,
 		cutoff = None,
 		sampling_rate = 16,
+		distribution = "sin", # "uniform / biased / data-driven / sin"
+		dist_init = None,
 	):
 		super().__init__()
 		self.in_channels = in_channels
 		self.out_channels = out_channels
 		self.sampling_rate = sampling_rate
 		self.cutoff = cutoff * 2 if cutoff is not None else sampling_rate
-		self.bandwidth = self.sampling_rate * (2 ** 0.3) #* (2 ** -0.9)
-		self.freq_dim = np.clip(self.sampling_rate * 4, a_min=512, a_max=2048)
-
+		self.bandwidth = self.sampling_rate * (2 ** 0.1) #* (2 ** -0.9)
+		self.freq_dim = np.clip(self.sampling_rate * 8, a_min=64, a_max=512)
 
 		# Draw random frequencies from uniform 2D disc.
 		freqs = torch.randn([self.in_channels, self.freq_dim, 2])
 		radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
-		dist = torch.randn([self.in_channels, self.freq_dim, 1]).sin()
-		dist = torch.sort(dist, dim=1)[0]
-		# freqs /= radii * radii.square().exp().pow(0.25)
-		freqs /= radii * dist
-		freqs *= self.bandwidth
+		freqs /= radii
+		if distribution == "uniform":
+			dist = radii.square().exp().pow(-0.25)
+		elif distribution == "biased":
+			dist = torch.rand([self.in_channels, self.freq_dim, 1])
+			dist = torch.sort(dist, dim=1)[0]	
+		elif distribution == "sin":
+			dist = torch.randn([self.in_channels, self.freq_dim, 1]).sin()
+			dist = torch.sort(dist, dim=1)[0]
+		elif distribution == "data-driven":
+			assert dist_init is not None
+			dist = dist_init
+
+		freqs *= (self.bandwidth * dist)
 		phases = torch.rand([self.in_channels, self.freq_dim]) - 0.5
 
-		self.register_buffer("dist", dist.squeeze(-1).abs().clip(min=0.1, max=0.3))
 		self.register_buffer("freqs", freqs)
-		# self.register_buffer("phases", phases)
 		self.phases = torch.nn.Parameter(phases)
 
 		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
@@ -234,13 +242,8 @@ class SynthesisGroupKernel(torch.nn.Module):
 		ix = ix + (in_phases).unsqueeze(2).unsqueeze(3)
 		ix = torch.sin(ix * (np.pi * 2))
 		
-		ix_drop = torch.rand([self.in_channels,self.freq_dim]).to(device=device)
-		drop_mask = (ix_drop >= self.dist)
-		drop_norm = drop_mask.float().square().mean().rsqrt().item()
-		ix = ix * drop_mask.view(1, self.in_channels, 1, 1, self.freq_dim)
-
 		out_mag = self.freq_out
-		kernel = torch.einsum('bihwf,bif,of->boihw', ix, in_mag, out_mag) * np.sqrt(drop_norm / (self.freq_dim * 2))
+		kernel = torch.einsum('bihwf,bif,of->boihw', ix, in_mag, out_mag) * np.sqrt(1 / (self.freq_dim * 2))
 		kernel = kernel + self.weight_bias * np.sqrt(1 / (2 * ks))
 
 		kernel = kernel.squeeze(0) * self.gain(ks)
@@ -455,8 +458,6 @@ class DiscriminatorEpilogue(torch.nn.Module):
 
 		self.conv_weight = SynthesisGroupKernel(in_channels + mbstd_num_channels, in_channels, sampling_rate=self.resolution)
 		self.conv_bias = torch.nn.Parameter(torch.zeros([in_channels]))
-		self.fc_weight = SynthesisGroupKernel(in_channels, in_channels, sampling_rate=self.resolution)
-		self.fc_bias = torch.nn.Parameter(torch.zeros([in_channels]))
 
 		self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
 		self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)
@@ -481,12 +482,7 @@ class DiscriminatorEpilogue(torch.nn.Module):
 		conv_w = self.conv_weight(device=x.device, ks=3).to(dtype=x.dtype)
 		conv_x = conv2d_resample.conv2d_resample(x=x, w=conv_w, padding=1, f=self.resample_filter, flip_weight=True)
 		x = bias_act.bias_act(x=conv_x, b=self.conv_bias.to(dtype=x.dtype), clamp=self.conv_clamp, act=self.activation, gain=1)
-
-		fc_w = self.fc_weight(device=x.device, ks=self.resolution).to(dtype=x.dtype).flatten(1)
-		x = x.flatten(1)
-		x = x.matmul(fc_w.t())
-		x = bias_act.bias_act(x, self.fc_bias, act=self.activation)
-
+		x = self.fc(x.flatten(1))
 		x = self.out(x)
 
 		# Conditioning.
