@@ -130,7 +130,7 @@ def get_dist_from_file(file_path):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-fdpk', 'stylegan3-fdpk-blur']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan2-fdpk', 'stylegan2-fdpk-blur', 'stylegan3-fdpk', 'stylegan3-fdpk-blur']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -243,13 +243,31 @@ def main(**kwargs):
 
     # Base configuration.
     c.ema_kimg = c.batch_size * 10 / 32
-    if opts.cfg == 'stylegan2':
+    if 'stylegan2' in opts.cfg:
         c.G_kwargs.class_name = 'training.networks_stylegan2.Generator'
         c.loss_kwargs.style_mixing_prob = 0.9 # Enable style mixing regularization.
         c.loss_kwargs.pl_weight = 2 # Enable path length regularization.
         c.G_reg_interval = 4 # Enable lazy regularization for G.
         c.G_kwargs.fused_modconv_default = 'inference_only' # Speed up training by using regular convolutions instead of grouped convolutions.
         c.loss_kwargs.pl_no_weight_grad = True # Speed up path length regularization by skipping gradient computation wrt. conv2d weights.
+
+        if 'stylegan2-fdpk' in opts.cfg:
+            c.D_kwargs.class_name = 'training.networks_stylegan3_synth.Discriminator'
+            c.D_kwargs.freq_dist = opts.freq_dist
+            c.D_kwargs.fdim_base = opts.fdim_base
+            c.D_kwargs.fdim_max = opts.fdim_max
+            c.D_kwargs.sort_dist = opts.sort_dist
+            if 'blur' in opts.cfg:
+                c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
+                c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
+            if opts.freq_dist == "data-driven":
+                raise("data driven init not implemented now")
+                assert opts.dist_init is not None
+                c.D_kwargs.dist_init = get_dist_from_file(opts.dist_init)
+            fdpk_desc = f"freq_dist:{opts.freq_dist}-fdim_max{opts.fdim_max}-fdim_base{opts.fdim_base}-sort_dist{opts.sort_dist}"
+            if opts.desc == None:
+                opts.desc = ""
+            opts.desc += fdpk_desc
     else:
         c.G_kwargs.class_name = 'training.networks_stylegan3.Generator'
         c.G_kwargs.magnitude_ema_beta = 0.5 ** (c.batch_size / (20 * 1e3))
