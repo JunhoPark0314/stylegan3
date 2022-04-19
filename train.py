@@ -273,7 +273,11 @@ def main(**kwargs):
                 raise("data driven init not implemented now")
                 assert opts.dist_init is not None
                 c.D_kwargs.dist_init = get_dist_from_file(opts.dist_init)
-
+            fdpk_desc = f"freq_dist:{opts.freq_dist}-fdim_max{opts.fdim_max}-fdim_base{opts.fdim_base}-sort_dist{opts.sort_dist}"
+            if opts.desc == None:
+                opts.desc = ""
+            opts.desc += fdpk_desc
+                
     # Augmentation.
     if opts.aug != 'noaug':
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', xflip=1, rotate90=1, xint=1, scale=1, rotate=1, aniso=1, xfrac=1, brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
