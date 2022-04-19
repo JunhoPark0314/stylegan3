@@ -1,4 +1,5 @@
 *.pyc
 data
+fast_data
 output
 .vscode
