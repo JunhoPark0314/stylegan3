@@ -151,3 +151,45 @@ def is50k(opts):
     return dict(is50k_mean=mean, is50k_std=std)
 
 #----------------------------------------------------------------------------
+# Change resolution
+@register_metric
+def fid50k_full_128(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=128)
+    return dict(fid50k_full_128=fid)
+
+@register_metric
+def fid50k_full_128(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=128)
+    return dict(fid50k_full_64=fid)
+
+@register_metric
+def fid50k_full_64(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=64)
+    return dict(fid50k_full_64=fid)
+
+@register_metric
+def fid50k_full_32(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=32)
+    return dict(fid50k_full_32=fid)
+
+@register_metric
+def fid50k_full_crop_128(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_crop_fid(opts, max_real=None, num_gen=50000, resolution=128, crop='torchvision.transforms.RandomCrop')
+    return dict(fid50k_full_32=fid)
+
+@register_metric
+def fid50k_full_crop_64(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_crop_fid(opts, max_real=None, num_gen=50000, resolution=64, crop='torchvision.transforms.RandomCrop')
+    return dict(fid50k_full_32=fid)
+
+@register_metric
+def fid50k_full_crop_32(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_crop_fid(opts, max_real=None, num_gen=50000, resolution=32, crop='torchvision.transforms.RandomCrop')
+    return dict(fid50k_full_32=fid)
