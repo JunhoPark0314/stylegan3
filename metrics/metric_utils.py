@@ -17,7 +17,7 @@ import uuid
 import numpy as np
 import torch
 import dnnlib
-import scipy
+import scipy.signal
 from dnnlib.util import call_func_by_name, get_obj_by_name
 
 from torch_utils.ops.upfirdn2d import downsample2d
