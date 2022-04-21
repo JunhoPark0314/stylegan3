@@ -314,7 +314,7 @@ def compute_feature_stats_for_dataset_wi_resize(opts, detector_url, detector_kwa
     ratio = original_resolution // target_resolution
     if ratio != 1:
         f = scipy.signal.firwin(numtaps=6 * ratio, cutoff=target_resolution * 0.5, width=target_resolution * (np.sqrt(2) - 1), fs=original_resolution)
-        f = torch.as_tensor(f, dtype=torch.float32)
+        f = torch.as_tensor(f, dtype=torch.float32, device=opts.device)
         # resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=ratio).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
         resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=1).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
     else:
@@ -333,7 +333,7 @@ def compute_feature_stats_for_dataset_wi_resize(opts, detector_url, detector_kwa
     for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
-        resized_images = resize(images)
+        resized_images = resize(images.to(opts.device))
         features = detector(resized_images.to(opts.device), **detector_kwargs)
         stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
         progress.update(stats.num_items)
@@ -369,7 +369,7 @@ def compute_feature_stats_for_generator_wi_resize(opts, detector_url, detector_k
     ratio = original_resolution // target_resolution
     if ratio != 1:
         f = scipy.signal.firwin(numtaps=6 * ratio, cutoff=target_resolution * 0.5, width=target_resolution * (np.sqrt(2) - 1), fs=original_resolution)
-        f = torch.as_tensor(f, dtype=torch.float32).cuda()
+        f = torch.as_tensor(f, dtype=torch.float32, device=opts.device)
         # resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=ratio).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
         resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=1).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
     else:
