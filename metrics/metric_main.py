@@ -37,6 +37,18 @@ def is_valid_metric(metric):
 def list_valid_metrics():
     return list(_metric_dict.keys())
 
+def has_done(metric, run_dir, snapshot_pkl):
+    if run_dir is not None and snapshot_pkl is not None:
+        network_pkl = os.path.relpath(snapshot_pkl, run_dir)
+
+    if run_dir is not None and os.path.isdir(run_dir) and os.path.isfile(os.path.join(run_dir, f'metric-{metric}.jsonl')):
+        with open(os.path.join(run_dir, f'metric-{metric}.jsonl'), 'r') as f:
+            for json_line in f:
+                json_dict = json.loads(json_line)
+                if json_dict["snapshot_pkl"] == network_pkl:
+                    return True
+    return False
+
 #----------------------------------------------------------------------------
 
 def calc_metric(metric, **kwargs): # See metric_utils.MetricOptions for the full list of arguments.
