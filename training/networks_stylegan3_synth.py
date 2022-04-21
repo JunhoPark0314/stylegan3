@@ -197,17 +197,16 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.cutoff = cutoff * 2 if cutoff is not None else sampling_rate
 		self.bandwidth = self.sampling_rate * (2 ** 0.1) #* (2 ** -0.9)
 		self.freq_dim = np.clip(fdim_base * self.sampling_rate, a_min=128, a_max=fdim_max)
+		self.freq_dist = freq_dist
 
 		# Draw random frequencies from uniform 2D disc.
 		freqs = torch.randn([self.in_channels, self.freq_dim, 2])
 		radii = freqs.square().sum(dim=-1, keepdim=True).sqrt()
 		freqs /= radii
-		if freq_dist == "uniform":
+		if (freq_dist == "uniform") or (freq_dist == "trainable"):
 			dist = radii.square().exp().pow(-0.25)
 		elif freq_dist == "low_biased":
 			dist = torch.rand([self.in_channels, self.freq_dim, 1])
-		elif freq_dist == "high_biased":
-			dist = torch.randn([self.in_channels, self.freq_dim, 1]).sin()
 		elif freq_dist == "data-driven":
 			assert dist_init is not None
 			dist = dist_init
@@ -218,7 +217,10 @@ class SynthesisGroupKernel(torch.nn.Module):
 		freqs *= (self.bandwidth * dist)
 		phases = torch.rand([self.in_channels, self.freq_dim]) - 0.5
 
-		self.register_buffer("freqs", freqs)
+		if freq_dist == "trainable":
+			self.freqs = torch.nn.Parameter(freqs / self.bandwidth)
+		else:
+			self.register_buffer("freqs", freqs)
 		self.phases = torch.nn.Parameter(phases)
 
 		self.freq_weight = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
@@ -229,7 +231,10 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 
 	def get_freqs(self):
-		return self.freqs
+		if self.freq_dist == 'trainable':
+			return self.freqs * self.bandwidth
+		else:
+			return self.freqs
 
 	def forward(self, device, ks, alpha=1, update_emas=False, style=None):
 		sample_size = ks
