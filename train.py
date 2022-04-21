@@ -130,7 +130,7 @@ def get_dist_from_file(file_path):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan2-fdpk', 'stylegan2-fdpk-blur', 'stylegan3-fdpk', 'stylegan3-fdpk-blur']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-t-blur', 'stylegan2-fdpk', 'stylegan2-fdpk-blur', 'stylegan3-fdpk', 'stylegan3-fdpk-blur']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -284,9 +284,7 @@ def main(**kwargs):
             c.D_kwargs.fdim_base = opts.fdim_base
             c.D_kwargs.fdim_max = opts.fdim_max
             c.D_kwargs.sort_dist = opts.sort_dist
-            if 'blur' in opts.cfg:
-                c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
-                c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
+
             if opts.freq_dist == "data-driven":
                 raise("data driven init not implemented now")
                 assert opts.dist_init is not None
@@ -295,6 +293,9 @@ def main(**kwargs):
             if opts.desc == None:
                 opts.desc = ""
             opts.desc += fdpk_desc
+        if 'blur' in opts.cfg:
+            c.loss_kwargs.blur_init_sigma = 10 # Blur the images seen by the discriminator.
+            c.loss_kwargs.blur_fade_kimg = c.batch_size * 200 / 32 # Fade out the blur during the first N kimg.
                 
     # Augmentation.
     if opts.aug != 'noaug':
