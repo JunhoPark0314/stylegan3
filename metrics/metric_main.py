@@ -37,6 +37,18 @@ def is_valid_metric(metric):
 def list_valid_metrics():
     return list(_metric_dict.keys())
 
+def has_done(metric, run_dir, snapshot_pkl):
+    if run_dir is not None and snapshot_pkl is not None:
+        network_pkl = os.path.relpath(snapshot_pkl, run_dir)
+
+    if run_dir is not None and os.path.isdir(run_dir) and os.path.isfile(os.path.join(run_dir, f'metric-{metric}.jsonl')):
+        with open(os.path.join(run_dir, f'metric-{metric}.jsonl'), 'r') as f:
+            for json_line in f:
+                json_dict = json.loads(json_line)
+                if json_dict["snapshot_pkl"] == network_pkl:
+                    return True
+    return False
+
 #----------------------------------------------------------------------------
 
 def calc_metric(metric, **kwargs): # See metric_utils.MetricOptions for the full list of arguments.
@@ -151,3 +163,45 @@ def is50k(opts):
     return dict(is50k_mean=mean, is50k_std=std)
 
 #----------------------------------------------------------------------------
+# Change resolution
+@register_metric
+def fid50k_full_128(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=128)
+    return dict(fid50k_full_128=fid)
+
+@register_metric
+def fid50k_full_128(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=128)
+    return dict(fid50k_full_64=fid)
+
+@register_metric
+def fid50k_full_64(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=64)
+    return dict(fid50k_full_64=fid)
+
+@register_metric
+def fid50k_full_32(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_res_fid(opts, max_real=None, num_gen=50000, resolution=32)
+    return dict(fid50k_full_32=fid)
+
+@register_metric
+def fid50k_full_crop_128(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_crop_fid(opts, max_real=None, num_gen=50000, resolution=128, crop='torchvision.transforms.RandomCrop')
+    return dict(fid50k_full_32=fid)
+
+@register_metric
+def fid50k_full_crop_64(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_crop_fid(opts, max_real=None, num_gen=50000, resolution=64, crop='torchvision.transforms.RandomCrop')
+    return dict(fid50k_full_32=fid)
+
+@register_metric
+def fid50k_full_crop_32(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_crop_fid(opts, max_real=None, num_gen=50000, resolution=32, crop='torchvision.transforms.RandomCrop')
+    return dict(fid50k_full_32=fid)

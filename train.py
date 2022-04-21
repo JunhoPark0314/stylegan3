@@ -153,7 +153,7 @@ def get_dist_from_file(file_path):
 @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
 @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
 @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['uniform', 'low_biased', 'high_biased', 'data-driven']), default="uniform", show_default=True)
+@click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['uniform', 'low_biased', 'trainable', 'data-driven']), default="uniform", show_default=True)
 @click.option('--fdim-base',    help='Frequency dimension scale factor', metavar='INT',         type=click.IntRange(min=1), default=8, show_default=True)
 @click.option('--fdim-max',     help='Maximum frequency dimension', metavar='INT',              type=click.IntRange(min=64), default=512, show_default=True)
 @click.option('--sort-dist',    help='Sort frequency set when initialize', metavar='BOOL',      type=bool, default=True, show_default=True)

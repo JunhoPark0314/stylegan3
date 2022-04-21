@@ -17,6 +17,11 @@ import uuid
 import numpy as np
 import torch
 import dnnlib
+import scipy
+from dnnlib.util import call_func_by_name, get_obj_by_name
+
+from torch_utils.ops.upfirdn2d import downsample2d
+from torchvision.utils import save_image
 
 #----------------------------------------------------------------------------
 
@@ -272,6 +277,212 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
         if images.shape[1] == 1:
             images = images.repeat([1, 3, 1, 1])
         features = detector(images, **detector_kwargs)
+        stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        progress.update(stats.num_items)
+    return stats
+
+#----------------------------------------------------------------------------
+
+def compute_feature_stats_for_dataset_wi_resize(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, data_loader_kwargs=None, max_items=None, resolution=None, **stats_kwargs):
+    dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
+    if data_loader_kwargs is None:
+        data_loader_kwargs = dict(pin_memory=True, num_workers=3, prefetch_factor=2)
+
+    # Try to lookup from cache.
+    cache_file = None
+    if opts.cache:
+        # Choose cache file name.
+        args = dict(dataset_kwargs=opts.dataset_kwargs, detector_url=detector_url, detector_kwargs=detector_kwargs, stats_kwargs=stats_kwargs, resolution=resolution)
+        md5 = hashlib.md5(repr(sorted(args.items())).encode('utf-8'))
+        cache_tag = f'{dataset.name}-{get_feature_detector_name(detector_url)}-{md5.hexdigest()}'
+        cache_file = dnnlib.make_cache_dir_path('gan-metrics', cache_tag + '.pkl')
+
+        # Check if the file exists (all processes must agree).
+        flag = os.path.isfile(cache_file) if opts.rank == 0 else False
+        if opts.num_gpus > 1:
+            flag = torch.as_tensor(flag, dtype=torch.float32, device=opts.device)
+            torch.distributed.broadcast(tensor=flag, src=0)
+            flag = (float(flag.cpu()) != 0)
+
+        # Load.
+        if flag:
+            return FeatureStats.load(cache_file)
+
+    # Generate Low pass filter
+    original_resolution = opts.dataset_kwargs['resolution']
+    target_resolution = resolution if resolution else original_resolution
+    ratio = original_resolution // target_resolution
+    if ratio != 1:
+        f = scipy.signal.firwin(numtaps=6 * ratio, cutoff=target_resolution * 0.5, width=target_resolution * (np.sqrt(2) - 1), fs=original_resolution)
+        f = torch.as_tensor(f, dtype=torch.float32)
+        # resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=ratio).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
+        resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=1).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
+    else:
+        resize = lambda x: x
+
+    # Initialize.
+    num_items = len(dataset)
+    if max_items is not None:
+        num_items = min(num_items, max_items)
+    stats = FeatureStats(max_items=num_items, **stats_kwargs)
+    progress = opts.progress.sub(tag='dataset features', num_items=num_items, rel_lo=rel_lo, rel_hi=rel_hi)
+    detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
+
+    # Main loop.
+    item_subset = [(i * opts.num_gpus + opts.rank) % num_items for i in range((num_items - 1) // opts.num_gpus + 1)]
+    for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        resized_images = resize(images)
+        features = detector(resized_images.to(opts.device), **detector_kwargs)
+        stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        progress.update(stats.num_items)
+
+    # Save to cache.
+    if cache_file is not None and opts.rank == 0:
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        temp_file = cache_file + '.' + uuid.uuid4().hex
+        stats.save(temp_file)
+        os.replace(temp_file, cache_file) # atomic
+    return stats
+
+#----------------------------------------------------------------------------
+
+def compute_feature_stats_for_generator_wi_resize(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, batch_gen=None, resolution=None, **stats_kwargs):
+    if batch_gen is None:
+        batch_gen = min(batch_size, 4)
+    assert batch_size % batch_gen == 0
+
+    # Setup generator and labels.
+    G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
+    c_iter = iterate_random_labels(opts=opts, batch_size=batch_gen)
+
+    # Initialize.
+    stats = FeatureStats(**stats_kwargs)
+    assert stats.max_items is not None
+    progress = opts.progress.sub(tag='generator features', num_items=stats.max_items, rel_lo=rel_lo, rel_hi=rel_hi)
+    detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
+
+    # Generate Low pass filter
+    original_resolution = opts.dataset_kwargs['resolution']
+    target_resolution = resolution if resolution else original_resolution
+    ratio = original_resolution // target_resolution
+    if ratio != 1:
+        f = scipy.signal.firwin(numtaps=6 * ratio, cutoff=target_resolution * 0.5, width=target_resolution * (np.sqrt(2) - 1), fs=original_resolution)
+        f = torch.as_tensor(f, dtype=torch.float32).cuda()
+        # resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=ratio).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
+        resize = lambda x: (downsample2d((x.to(torch.float32) / 255).clip(min=1e-8, max=1-1e-8), f, down=1).clip(min=1e-8, max=1-1e-8) * 255).to(torch.uint8)
+    else:
+        resize = lambda x: x
+
+    # Main loop.
+    while not stats.is_full():
+        images = []
+        for _i in range(batch_size // batch_gen):
+            z = torch.randn([batch_gen, G.z_dim], device=opts.device)
+            img = G(z=z, c=next(c_iter), **opts.G_kwargs)
+            img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+            images.append(img)
+        images = torch.cat(images)
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        resized_images = resize(images)
+        features = detector(resized_images, **detector_kwargs)
+        stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        progress.update(stats.num_items)
+    return stats
+
+#----------------------------------------------------------------------------
+
+def compute_feature_stats_for_dataset_wi_crop(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, data_loader_kwargs=None, max_items=None, resolution=None, crop=None, crop_iter=5, **stats_kwargs):
+    dataset = dnnlib.util.construct_class_by_name(**opts.dataset_kwargs)
+    if data_loader_kwargs is None:
+        data_loader_kwargs = dict(pin_memory=True, num_workers=3, prefetch_factor=2)
+
+    # Try to lookup from cache.
+    cache_file = None
+    if opts.cache:
+        # Choose cache file name.
+        args = dict(dataset_kwargs=opts.dataset_kwargs, detector_url=detector_url, detector_kwargs=detector_kwargs, stats_kwargs=stats_kwargs, resolution=resolution, crop=crop)
+        md5 = hashlib.md5(repr(sorted(args.items())).encode('utf-8'))
+        cache_tag = f'{dataset.name}-{get_feature_detector_name(detector_url)}-{md5.hexdigest()}'
+        cache_file = dnnlib.make_cache_dir_path('gan-metrics', cache_tag + '.pkl')
+
+        # Check if the file exists (all processes must agree).
+        flag = os.path.isfile(cache_file) if opts.rank == 0 else False
+        if opts.num_gpus > 1:
+            flag = torch.as_tensor(flag, dtype=torch.float32, device=opts.device)
+            torch.distributed.broadcast(tensor=flag, src=0)
+            flag = (float(flag.cpu()) != 0)
+
+        # Load.
+        if flag:
+            return FeatureStats.load(cache_file)
+
+    # Generate Low pass filter
+    crop = get_obj_by_name(crop)(size=resolution)
+
+    # Initialize.
+    num_items = len(dataset)
+    if max_items is not None:
+        num_items = min(num_items, max_items)
+    stats = FeatureStats(max_items=num_items * crop_iter, **stats_kwargs)
+    progress = opts.progress.sub(tag='dataset features', num_items=num_items * crop_iter, rel_lo=rel_lo, rel_hi=rel_hi)
+    detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
+
+    # Main loop.
+    item_subset = [(i * opts.num_gpus + opts.rank) % num_items for i in range((num_items - 1) // opts.num_gpus + 1)]
+    for images, _labels in torch.utils.data.DataLoader(dataset=dataset, sampler=item_subset, batch_size=batch_size, **data_loader_kwargs):
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        
+        for i in range(crop_iter):
+            cropped_images = crop(images)
+            features = detector(cropped_images.to(opts.device), **detector_kwargs)
+            stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
+        progress.update(stats.num_items)
+
+    # Save to cache.
+    if cache_file is not None and opts.rank == 0:
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        temp_file = cache_file + '.' + uuid.uuid4().hex
+        stats.save(temp_file)
+        os.replace(temp_file, cache_file) # atomic
+    return stats
+
+#----------------------------------------------------------------------------
+
+def compute_feature_stats_for_generator_wi_crop(opts, detector_url, detector_kwargs, rel_lo=0, rel_hi=1, batch_size=64, batch_gen=None, resolution=None, crop=None, crop_iter=5, **stats_kwargs):
+    if batch_gen is None:
+        batch_gen = min(batch_size, 4)
+    assert batch_size % batch_gen == 0
+
+    # Setup generator and labels.
+    G = copy.deepcopy(opts.G).eval().requires_grad_(False).to(opts.device)
+    c_iter = iterate_random_labels(opts=opts, batch_size=batch_gen)
+
+    # Initialize.
+    stats = FeatureStats(**stats_kwargs)
+    assert stats.max_items is not None
+    progress = opts.progress.sub(tag='generator features', num_items=stats.max_items, rel_lo=rel_lo, rel_hi=rel_hi)
+    detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
+
+    # Generate Low pass filter
+    crop = get_obj_by_name(crop)(size=resolution)
+
+    # Main loop.
+    while not stats.is_full():
+        images = []
+        for _i in range(batch_size // batch_gen):
+            z = torch.randn([batch_gen, G.z_dim], device=opts.device)
+            img = G(z=z, c=next(c_iter), **opts.G_kwargs)
+            img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)
+            images.append(img)
+        images = torch.cat(images)
+        if images.shape[1] == 1:
+            images = images.repeat([1, 3, 1, 1])
+        cropped_images = crop(images)
+        features = detector(cropped_images, **detector_kwargs)
         stats.append_torch(features, num_gpus=opts.num_gpus, rank=opts.rank)
         progress.update(stats.num_items)
     return stats
