@@ -195,8 +195,8 @@ class SynthesisGroupKernel(torch.nn.Module):
 		self.out_channels = out_channels
 		self.sampling_rate = sampling_rate
 		self.bandwidth = self.sampling_rate * (2 ** 0.1) #* (2 ** -0.9)
-		self.freq_dim = int(np.clip(self.sampling_rate * fdim_base, a_min=128, a_max=fdim_max))
-		# self.freq_dim = self.out_channels
+		# self.freq_dim = int(np.clip(self.sampling_rate * fdim_base, a_min=128, a_max=fdim_max))
+		self.freq_dim = self.out_channels
 		self.freq_dist = freq_dist
 
 		# Draw random frequencies from uniform 2D square.
@@ -233,8 +233,6 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 		self.magnitude = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
 		self.out_linear = torch.nn.Parameter(torch.randn([out_channels, self.freq_dim]))
-		# self.register_buffer("magnitude", torch.randn([in_channels, self.freq_dim]))
-		# self.register_buffer("out_linear", torch.randn([out_channels, self.freq_dim]))
 
 		self.gain = float(np.sqrt(1 / (in_channels * (kernel_size ** 2))))
 		self.freq_gain = float(np.sqrt(1 / (self.freq_dim)))
@@ -252,7 +250,6 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 		basis  = self.get_basis()
 		kernel = torch.einsum('ihwf,if,of->oihw', basis, self.magnitude, self.out_linear) * self.freq_gain
-		# kernel = torch.einsum('ihwf,of->oihw', basis, self.out_linear) * self.freq_gain
 		if hasattr(self, 'weight_bias'):		
 			kernel = kernel + self.weight_bias * np.sqrt(1 / (2 * ks))
 		kernel = kernel * self.gain
@@ -313,17 +310,20 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.conv_clamp = conv_clamp
 		self.activation = activation
 		self.act_gain = bias_act.activation_funcs[activation].def_gain
+		self.out_channels = out_channels
+		self.pad = 1 if self.in_channels == 0 else 0
+		self.pad_next = 0 if self.resolution == 8 else 4
 
 		self.conv0_weight = SynthesisGroupKernel(tmp_channels, tmp_channels, sampling_rate=self.resolution
 			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, dist_init=dist_init, sort_dist=sort_dist)
 		self.conv0_bias = torch.nn.Parameter(torch.zeros([tmp_channels]))
-		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, sampling_rate=self.resolution
+		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels//4, sampling_rate=self.resolution
 			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, dist_init=dist_init, sort_dist=sort_dist)
-		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
+		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels//4]))
 
-		if architecture == 'resnet':
-			self.skip = Conv2dLayer(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
-				trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
+		# if architecture == 'resnet':
+		# 	self.skip = Conv2dLayer(tmp_channels, out_channels//4, kernel_size=1, bias=False, down=1,
+		# 		trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
 
 	def forward(self, x, img, force_fp32=False, update_emas=False):
 		if (x if x is not None else img).device.type != 'cuda':
@@ -333,7 +333,7 @@ class DiscriminatorBlock(torch.nn.Module):
 
 		# Input.
 		if x is not None:
-			misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution])
+			# misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution])
 			x = x.to(dtype=dtype, memory_format=memory_format)
 
 		# FromRGB.
@@ -348,17 +348,21 @@ class DiscriminatorBlock(torch.nn.Module):
 		if self.architecture == 'resnet':
 			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
 
-			y = self.skip(x, gain=np.sqrt(0.5))
+			# y = self.skip(x, gain=np.sqrt(0.5))
 
 			conv0_w = self.conv0_weight(device=x.device, ks=3, update_emas=update_emas).to(dtype=x.dtype)
-			conv0_x = conv2d_resample.conv2d_resample(x=x, w=conv0_w, padding=1, f=self.resample_filter, flip_weight=True)
+			conv0_x = conv2d_resample.conv2d_resample(x=x, w=conv0_w, padding=self.pad, f=self.resample_filter, flip_weight=True)
 			x = bias_act.bias_act(x=conv0_x, b=self.conv0_bias.to(dtype=x.dtype), clamp=act_clamp, act='lrelu', gain=1)
 
 			conv1_w = self.conv1_weight(device=x.device, ks=3, update_emas=update_emas).to(dtype=x.dtype)
-			conv1_x = conv2d_resample.conv2d_resample(x=x, w=conv1_w, padding=1, f=self.resample_filter, down=2, flip_weight=True)
-			x = bias_act.bias_act(x=conv1_x, b=self.conv1_bias.to(dtype=x.dtype), clamp=act_clamp, act='lrelu', gain=np.sqrt(0.5))
+			conv1_x = conv2d_resample.conv2d_resample(x=x, w=conv1_w, padding=self.pad, f=self.resample_filter, down=1, flip_weight=True)
+			x = bias_act.bias_act(x=conv1_x, b=self.conv1_bias.to(dtype=x.dtype), clamp=act_clamp, act='lrelu', gain=1)
 
-			x = y.add_(x)
+			# x = y.add_(x)
+
+			x = torch.roll(x, shifts=[self.resolution//4, self.resolution//4], dims=[2,3])
+			x = torch.nn.functional.unfold(x, kernel_size=self.resolution//2+self.pad_next, stride=self.resolution//2-self.pad_next)
+			x = x.view(-1, self.out_channels//4 , self.resolution//2+self.pad_next, self.resolution//2+self.pad_next, 4).permute(0,1,4,2,3).flatten(1,2)
 
 			# outgain = (x.square().mean(dim=[2,3], keepdim=True) + 1e-8).rsqrt().clip(min=0.2, max=5)
 			# x = x * outgain

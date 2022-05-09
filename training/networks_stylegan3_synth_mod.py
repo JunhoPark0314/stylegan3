@@ -9,6 +9,7 @@
 """Generator architecture from the paper
 "Alias-Free Generative Adversarial Networks"."""
 
+from queue import Full
 import numpy as np
 import torch
 import dnnlib
@@ -18,6 +19,7 @@ from torch_utils.ops import bias_act
 from torch_utils.ops import conv2d_resample
 from torch_utils.ops import upfirdn2d
 from torchvision.utils import save_image
+from torch_utils import training_stats
 
 #----------------------------------------------------------------------------
 
@@ -178,33 +180,54 @@ class MappingNetwork(torch.nn.Module):
 		return f'z_dim={self.z_dim:d}, c_dim={self.c_dim:d}, w_dim={self.w_dim:d}, num_ws={self.num_ws:d}'
 
 #----------------------------------------------------------------------------
-class SynthesisGroupKernel(torch.nn.Module):
-	def __init__(self,
+class SynthesisGroupConv2d(torch.nn.Module):
+	def __init__(
+		self,
 		in_channels,
 		out_channels,
 		sampling_rate = 16,
 		freq_dist = "sin", # "uniform / biased / data-driven / sin"
-		dist_init = None,
 		fdim_max = 512,
 		fdim_base = 8,
-		sort_dist = True,
 		kernel_size = 3,
+		resample_filter = [1, 3, 3, 1],
+		padding = 1,
+		act_clamp = 255,
+		cond_dim = 64,
+		num_freq_set = 16,
+		# ... Conv parameters
 	):
 		super().__init__()
 		self.in_channels = in_channels
 		self.out_channels = out_channels
 		self.sampling_rate = sampling_rate
+		self.kernel_size = kernel_size
 		self.bandwidth = self.sampling_rate * (2 ** 0.1) #* (2 ** -0.9)
 		self.freq_dim = int(np.clip(self.sampling_rate * fdim_base, a_min=128, a_max=fdim_max))
-		# self.freq_dim = self.out_channels
 		self.freq_dist = freq_dist
+		self.padding = padding
+		self.act_clamp = act_clamp
+		self.cond_dim = cond_dim
+		self.num_freq_set = num_freq_set
+		self.init_weight_gen(freq_dist, kernel_size, in_channels, out_channels)
+		self.register_buffer('resample_filter', upfirdn2d.setup_filter(resample_filter))
 
-		# Draw random frequencies from uniform 2D square.
+	def init_weight_gen(self, freq_dist, kernel_size, in_channels, out_channels):
+		magnitude = torch.randn([in_channels, self.freq_dim])
+		out_linear = torch.randn([out_channels, self.freq_dim])
 
 		if freq_dist == "random_train":
-			self.basis = torch.nn.Parameter(torch.randn([self.in_channels, 3, 3, self.freq_dim]))
+			self.basis = torch.nn.Parameter(torch.randn([self.in_channels, self.kernel_size, self.kernel_size, self.freq_dim]))
 		elif freq_dist == "random_fixed":
-			self.register_buffer("basis", torch.randn([self.in_channels, 3, 3, self.freq_dim]))
+			self.register_buffer("basis", torch.randn([self.in_channels, self.kernel_size, self.kernel_size, self.freq_dim]))
+		elif freq_dist == "random_dynamic":
+			self.basis = torch.nn.Parameter(torch.randn([self.in_channels, self.kernel_size, self.kernel_size, self.freq_dim]))
+			self.affine_mag = FullyConnectedLayer(self.cond_dim, self.num_freq_set, bias=True, bias_init=0)
+			self.affine_out = FullyConnectedLayer(self.cond_dim, self.num_freq_set, bias=True, bias_init=0)
+
+			magnitude = torch.randn([self.num_freq_set, in_channels, self.freq_dim])
+			out_linear = torch.randn([self.num_freq_set, out_channels, self.freq_dim])
+
 		elif freq_dist == "four_train":
 			freqs = torch.rand([self.in_channels, self.freq_dim, 2])
 			self.register_buffer("freqs", freqs)
@@ -229,35 +252,68 @@ class SynthesisGroupKernel(torch.nn.Module):
 
 			phases = torch.rand([self.in_channels, 1, 1, self.freq_dim]) - 0.5
 			self.register_buffer("phases", phases)
-			self.weight_bias = torch.nn.Parameter(torch.randn([out_channels, in_channels, 1, 1]))
+			self.weight_bias = torch.nn.Parameter(torch.randn([1, out_channels, in_channels, 1, 1]))
 
-		self.magnitude = torch.nn.Parameter(torch.randn([in_channels, self.freq_dim]))
-		self.out_linear = torch.nn.Parameter(torch.randn([out_channels, self.freq_dim]))
-		# self.register_buffer("magnitude", torch.randn([in_channels, self.freq_dim]))
-		# self.register_buffer("out_linear", torch.randn([out_channels, self.freq_dim]))
+		self.magnitude = torch.nn.Parameter(magnitude)
+		self.out_linear = torch.nn.Parameter(out_linear)
+
+		# self.register_buffer("magnitude", torch.randn(in_channels, self.freq_dim))
+		# self.register_buffer("out_linear", torch.randn(out_channels, self.freq_dim))
 
 		self.gain = float(np.sqrt(1 / (in_channels * (kernel_size ** 2))))
 		self.freq_gain = float(np.sqrt(1 / (self.freq_dim)))
 
+		self.bias = torch.nn.Parameter(torch.zeros([self.out_channels]))
+
 	def get_basis(self):
-		if self.freq_dist in ["random_train", "random_fixed"]:
+		if self.freq_dist in ["random_train", "random_fixed", "random_dynamic"]:
 			return self.basis
-		else:
-			ix = torch.einsum('hwr,ifr->ihwf', self.grids, self.freqs)
-			ix = ix + self.phases
-			ix = torch.sin(ix * (np.pi * 2))
-			return ix
 
-	def forward(self, device, ks=3, alpha=1, update_emas=False, style=None):
-
+		ix = torch.einsum('hwr,ifr->ihwf', self.grids, self.freqs)
+		ix = ix + self.phases
+		ix = torch.sin(ix * (np.pi * 2))
+		return ix
+	
+	def weight_gen(self, c, size):
+		ks = self.kernel_size
 		basis  = self.get_basis()
-		kernel = torch.einsum('ihwf,if,of->oihw', basis, self.magnitude, self.out_linear) * self.freq_gain
-		# kernel = torch.einsum('ihwf,of->oihw', basis, self.out_linear) * self.freq_gain
+		magnitude = self.magnitude.unsqueeze(0)
+		out_linear = self.out_linear.unsqueeze(0)
+
+		if self.freq_dist == "random_dynamic":
+			s_mag = self.affine_mag(c)
+			s_out = self.affine_out(c)
+			# s = (s / 10).softmax(dim=-1)
+
+			s_mag = s_mag.softmax(dim=-1)
+			s_out = s_out.softmax(dim=-1)
+
+			training_stats.report0_hist(f"softmax_{size}", s_mag.argmax(dim=1).cpu())
+			training_stats.report0_hist(f"training/softmax_{size}", s_mag.max(dim=1)[0].cpu())
+			magnitude = torch.einsum('bkif,bk->bif',magnitude,s_mag)
+			out_linear = torch.einsum('bkof,bk->bof', out_linear, s_out)
+			
+		kernel = torch.einsum('ihwf,bif,bof->boihw', basis, magnitude, out_linear) * self.freq_gain
 		if hasattr(self, 'weight_bias'):		
 			kernel = kernel + self.weight_bias * np.sqrt(1 / (2 * ks))
 		kernel = kernel * self.gain
 
-		return kernel
+		return kernel.squeeze(0)
+
+	def forward(self, x, cond, up=1, down=1, gain=1):
+
+		kernel = self.weight_gen(cond, x.shape[-1]).to(dtype=x.dtype)
+		group_size = 1
+		batch_size = x.shape[0]
+		if self.freq_dist == "random_dynamic":
+			kernel = kernel.reshape(-1, self.in_channels, self.kernel_size, self.kernel_size)
+			x = x.reshape(1, -1, *x.shape[2:])
+			group_size = batch_size
+
+		x = conv2d_resample.conv2d_resample(x=x, w=kernel, padding=self.padding, groups=group_size, f=self.resample_filter, flip_weight=True, up=up, down=down)
+		x = x.reshape(batch_size, -1, *x.shape[2:])
+		x = bias_act.bias_act(x=x, b=self.bias.to(dtype=x.dtype), clamp=self.act_clamp, act='lrelu', gain=gain)
+		return x
 
 #----------------------------------------------------------------------------
 
@@ -314,18 +370,17 @@ class DiscriminatorBlock(torch.nn.Module):
 		self.activation = activation
 		self.act_gain = bias_act.activation_funcs[activation].def_gain
 
-		self.conv0_weight = SynthesisGroupKernel(tmp_channels, tmp_channels, sampling_rate=self.resolution
-			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, dist_init=dist_init, sort_dist=sort_dist)
-		self.conv0_bias = torch.nn.Parameter(torch.zeros([tmp_channels]))
-		self.conv1_weight = SynthesisGroupKernel(tmp_channels, out_channels, sampling_rate=self.resolution
-			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, dist_init=dist_init, sort_dist=sort_dist)
-		self.conv1_bias = torch.nn.Parameter(torch.zeros([out_channels]))
+		self.conv0 = SynthesisGroupConv2d(tmp_channels, tmp_channels, sampling_rate=self.resolution
+			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, act_clamp=conv_clamp)
+
+		self.conv1 = SynthesisGroupConv2d(tmp_channels, out_channels, sampling_rate=self.resolution
+			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, act_clamp=conv_clamp)
 
 		if architecture == 'resnet':
 			self.skip = Conv2dLayer(tmp_channels, out_channels, kernel_size=1, bias=False, down=2,
 				trainable=next(trainable_iter), resample_filter=resample_filter, channels_last=self.channels_last)
 
-	def forward(self, x, img, force_fp32=False, update_emas=False):
+	def forward(self, x, img, cond, force_fp32=False, update_emas=False):
 		if (x if x is not None else img).device.type != 'cuda':
 			force_fp32 = True
 		dtype = torch.float16 if self.use_fp16 and not force_fp32 else torch.float32
@@ -346,22 +401,12 @@ class DiscriminatorBlock(torch.nn.Module):
 
 		# Main layers.
 		if self.architecture == 'resnet':
-			act_clamp = self.conv_clamp if self.conv_clamp is not None else None
-
 			y = self.skip(x, gain=np.sqrt(0.5))
 
-			conv0_w = self.conv0_weight(device=x.device, ks=3, update_emas=update_emas).to(dtype=x.dtype)
-			conv0_x = conv2d_resample.conv2d_resample(x=x, w=conv0_w, padding=1, f=self.resample_filter, flip_weight=True)
-			x = bias_act.bias_act(x=conv0_x, b=self.conv0_bias.to(dtype=x.dtype), clamp=act_clamp, act='lrelu', gain=1)
-
-			conv1_w = self.conv1_weight(device=x.device, ks=3, update_emas=update_emas).to(dtype=x.dtype)
-			conv1_x = conv2d_resample.conv2d_resample(x=x, w=conv1_w, padding=1, f=self.resample_filter, down=2, flip_weight=True)
-			x = bias_act.bias_act(x=conv1_x, b=self.conv1_bias.to(dtype=x.dtype), clamp=act_clamp, act='lrelu', gain=np.sqrt(0.5))
+			x = self.conv0(x, cond, gain=1)
+			x = self.conv1(x, cond, down=2, gain=1)
 
 			x = y.add_(x)
-
-			# outgain = (x.square().mean(dim=[2,3], keepdim=True) + 1e-8).rsqrt().clip(min=0.2, max=5)
-			# x = x * outgain
 		else:
 			x = self.conv0(x)
 			x = self.conv1(x)
@@ -433,6 +478,41 @@ class MinibatchSpatialLayer(torch.nn.Module):
 #----------------------------------------------------------------------------
 
 @persistence.persistent_class
+class ModNetwork(torch.nn.Module):
+	def __init__(
+		self, 
+		sampling_rate=32,
+		img_channels=3,
+		hidden_dim = 64,
+		resample_filter=[1,3,3,1]):
+		super().__init__()
+		self.sampling_rate = sampling_rate
+		# self.register_buffer("embed", torch.randn([1, sampling_rate * (sampling_rate//2 + 1), hidden_dim]))
+		# self.bn1 = torch.nn.BatchNorm1d(sampling_rate * (sampling_rate // 2 + 1), affine=False)
+		# self.bn2 = torch.nn.BatchNorm1d(hidden_dim, affine=False)
+		# self.alpha = torch.nn.Parameter(torch.randn([1, sampling_rate * (sampling_rate // 2 + 1)]) / 0.01)
+		# self.beta = torch.nn.Parameter(torch.randn([1, sampling_rate * (sampling_rate // 2 + 1)]) / 0.01)
+
+		self.register_buffer("resample_filter", upfirdn2d.setup_filter(resample_filter))
+		self.fc1 = FullyConnectedLayer(3 * 32 ** 2, hidden_dim * 2, activation="lrelu")
+		self.fc2 = FullyConnectedLayer(hidden_dim * 2, hidden_dim, activation="lrelu")
+
+	def forward(self, x):
+		N, C, H, W = x.shape
+		s = H // 32
+		# fft_x = torch.fft.rfft2(x).abs().square().mean(dim=1).sqrt().log().flatten(1,) / 10
+		mod_x = torch.nn.functional.interpolate(x, scale_factor=1/s)
+
+		# fft_x = torch.fft.rfft2(x).abs().square().mean(dim=1).sqrt().log().flatten(1,)
+		# fft_x = self.bn1(fft_x)
+
+		# mod_x = ((fft_x * self.alpha) + self.beta) * 0.01
+		# mod_x = torch.einsum('bih,bi->bh', self.embed, fft_x) * np.sqrt(2) / (self.sampling_rate)
+		cond = self.fc1(mod_x.flatten(1,))
+		cond = self.fc2(cond)
+		return cond
+
+@persistence.persistent_class
 class DiscriminatorEpilogue(torch.nn.Module):
 	def __init__(self,
 		in_channels,                    # Number of input channels.
@@ -467,14 +547,17 @@ class DiscriminatorEpilogue(torch.nn.Module):
 			self.fromrgb = Conv2dLayer(img_channels, in_channels, kernel_size=1, activation=activation)
 		self.mbstd = MinibatchStdLayer(group_size=mbstd_group_size, num_channels=mbstd_num_channels) if mbstd_num_channels > 0 else None
 
-		self.conv_weight = SynthesisGroupKernel(in_channels + mbstd_num_channels, in_channels, sampling_rate=self.resolution
-			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, dist_init=dist_init, sort_dist=sort_dist)
-		self.conv_bias = torch.nn.Parameter(torch.zeros([in_channels]))
+		self.conv = SynthesisGroupConv2d(in_channels + mbstd_num_channels, in_channels, sampling_rate=self.resolution
+			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, act_clamp=conv_clamp)
 
 		self.fc = FullyConnectedLayer(in_channels * (resolution ** 2), in_channels, activation=activation)
+
+		self.mod_fc = SynthesisGroupConv2d(in_channels , in_channels, kernel_size=resolution, padding=0, sampling_rate=self.resolution
+			,freq_dist=freq_dist, fdim_base=fdim_base, fdim_max=fdim_max, act_clamp=conv_clamp)
+
 		self.out = FullyConnectedLayer(in_channels, 1 if cmap_dim == 0 else cmap_dim)
 
-	def forward(self, x, img, cmap, force_fp32=False):
+	def forward(self, x, img, cmap, cond, force_fp32=False):
 		misc.assert_shape(x, [None, self.in_channels, self.resolution, self.resolution]) # [NCHW]
 		_ = force_fp32 # unused
 		dtype = torch.float32
@@ -491,10 +574,9 @@ class DiscriminatorEpilogue(torch.nn.Module):
 		if self.mbstd is not None:
 			x = self.mbstd(x)
 		
-		conv_w = self.conv_weight(device=x.device, ks=3).to(dtype=x.dtype)
-		conv_x = conv2d_resample.conv2d_resample(x=x, w=conv_w, padding=1, f=self.resample_filter, flip_weight=True)
-		x = bias_act.bias_act(x=conv_x, b=self.conv_bias.to(dtype=x.dtype), clamp=self.conv_clamp, act=self.activation, gain=1)
-		x = self.fc(x.flatten(1))
+		x = self.conv(x, cond)
+		# x = self.fc(x.flatten(1))
+		x = self.mod_fc(x, cond).squeeze(-1).squeeze(-1)
 		x = self.out(x)
 
 		# Conditioning.
@@ -527,6 +609,7 @@ class Discriminator(torch.nn.Module):
 		fdim_max			= 512,
 		dist_init			= None,
 		sort_dist			= True,
+		mod_sample_rate		= 16,
 		block_kwargs        = {},       # Arguments for DiscriminatorBlock.
 		mapping_kwargs      = {},       # Arguments for MappingNetwork.
 		epilogue_kwargs     = {},       # Arguments for DiscriminatorEpilogue.
@@ -539,6 +622,8 @@ class Discriminator(torch.nn.Module):
 		self.block_resolutions = [2 ** i for i in range(self.img_resolution_log2, 2, -1)]
 		channels_dict = {res: min(channel_base // res, channel_max) for res in self.block_resolutions + [4]}
 		fp16_resolution = max(2 ** (self.img_resolution_log2 + 1 - num_fp16_res), 8)
+		# for res in [128, 64, 32]:
+		# 	channels_dict[res] = 512
 
 		if cmap_dim is None:
 			cmap_dim = channels_dict[4]
@@ -561,17 +646,22 @@ class Discriminator(torch.nn.Module):
 			self.mapping = MappingNetwork(z_dim=0, c_dim=c_dim, w_dim=cmap_dim, num_ws=None, w_avg_beta=None, **mapping_kwargs)
 		self.b4 = DiscriminatorEpilogue(channels_dict[4], cmap_dim=cmap_dim, resolution=4, **epilogue_kwargs, **common_kwargs)
 
+		self.mod_mlp = ModNetwork(sampling_rate=img_resolution, img_channels=img_channels)
+
 	def forward(self, img, c, update_emas=False, **block_kwargs):
 		_ = update_emas # unused
 		x = None
+
+		weight_gen_cond = self.mod_mlp(img)
+
 		for res in self.block_resolutions:
 			block = getattr(self, f'b{res}')
-			x, img = block(x, img, **block_kwargs)
+			x, img = block(x, img, weight_gen_cond, **block_kwargs)
 
 		cmap = None
 		if self.c_dim > 0:
 			cmap = self.mapping(None, c)
-		x = self.b4(x, img, cmap)
+		x = self.b4(x, img, cmap, weight_gen_cond)
 		return x
 
 	def extra_repr(self):

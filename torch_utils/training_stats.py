@@ -11,6 +11,7 @@ multiple processes and devices. The interface is designed to minimize
 synchronization overhead as well as the amount of boilerplate in user
 code."""
 
+from collections import defaultdict
 import re
 import numpy as np
 import torch
@@ -28,6 +29,7 @@ _sync_device    = None          # Device to use for multiprocess communication. 
 _sync_called    = False         # Has _sync() been called yet?
 _counters       = dict()        # Running counters on each device, updated by report(): name => device => torch.Tensor
 _cumulative     = dict()        # Cumulative counters on the CPU, updated by _sync(): name => torch.Tensor
+_buffer         = defaultdict(list)
 
 #----------------------------------------------------------------------------
 
@@ -106,6 +108,15 @@ def report0(name, value):
     See `report()` for further details.
     """
     report(name, value if _rank == 0 else [])
+    return value
+
+def report0_hist(name, value):
+    r"""Broadcasts the given set of scalars by the first process (`rank = 0`),
+    but ignores any scalars provided by the other processes.
+    See `report()` for further details.
+    """
+    _buffer[name].append(value)
+
     return value
 
 #----------------------------------------------------------------------------

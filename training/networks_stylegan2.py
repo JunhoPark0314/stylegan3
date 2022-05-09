@@ -155,6 +155,10 @@ class Conv2dLayer(torch.nn.Module):
         self.padding = kernel_size // 2
         self.weight_gain = 1 / np.sqrt(in_channels * (kernel_size ** 2))
         self.act_gain = bias_act.activation_funcs[activation].def_gain
+        if kernel_size == 3:
+            self.mag = torch.nn.Parameter(torch.randn([out_channels, in_channels, 1, 1]))
+        else:
+            self.mag = 1
 
         memory_format = torch.channels_last if channels_last else torch.contiguous_format
         weight = torch.randn([out_channels, in_channels, kernel_size, kernel_size]).to(memory_format=memory_format)
@@ -170,7 +174,7 @@ class Conv2dLayer(torch.nn.Module):
                 self.bias = None
 
     def forward(self, x, gain=1):
-        w = self.weight * self.weight_gain
+        w = self.weight * self.weight_gain * self.mag
         b = self.bias.to(x.dtype) if self.bias is not None else None
         flip_weight = (self.up == 1) # slightly faster
         x = conv2d_resample.conv2d_resample(x=x, w=w.to(x.dtype), f=self.resample_filter, up=self.up, down=self.down, padding=self.padding, flip_weight=flip_weight)

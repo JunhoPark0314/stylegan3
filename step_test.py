@@ -17,7 +17,7 @@ import tempfile
 import torch
 
 import dnnlib
-from training import training_loop
+from training import step_test_loop
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
@@ -44,7 +44,7 @@ def subprocess_fn(rank, c, temp_dir):
         custom_ops.verbosity = 'none'
 
     # Execute training loop.
-    training_loop.training_loop(rank=rank, **c)
+    step_test_loop.training_loop(rank=rank, **c)
 
 #----------------------------------------------------------------------------
 
@@ -69,7 +69,7 @@ def launch_training(c, desc, outdir, dry_run):
     print(f'Output directory:    {c.run_dir}')
     print(f'Number of GPUs:      {c.num_gpus}')
     print(f'Batch size:          {c.batch_size} images')
-    print(f'Training duration:   {c.total_kimg} kimg')
+    print(f'Training duration:   {c.total_step} step')
     print(f'Dataset path:        {c.training_set_kwargs.path}')
     print(f'Dataset size:        {c.training_set_kwargs.max_size} images')
     print(f'Dataset resolution:  {c.training_set_kwargs.resolution}')
@@ -130,7 +130,7 @@ def get_dist_from_file(file_path):
 
 # Required.
 @click.option('--outdir',       help='Where to save the results', metavar='DIR',                required=True)
-@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-t-blur', 'stylegan2-fdpk', 'stylegan2-fdpk-blur', 'stylegan3-fdpk', 'stylegan3-fdpk-blur', 'stylegan2-roll', 'stylegan2-mod']), required=True)
+@click.option('--cfg',          help='Base configuration',                                      type=click.Choice(['stylegan3-t', 'stylegan3-r', 'stylegan2', 'stylegan3-t-blur', 'stylegan2-fdpk', 'stylegan2-fdpk-blur', 'stylegan3-fdpk', 'stylegan3-fdpk-blur', 'stylegan2-roll']), required=True)
 @click.option('--data',         help='Training data', metavar='[ZIP|DIR]',                      type=str, required=True)
 @click.option('--gpus',         help='Number of GPUs to use', metavar='INT',                    type=click.IntRange(min=1), required=True)
 @click.option('--batch',        help='Total batch size', metavar='INT',                         type=click.IntRange(min=1), required=True)
@@ -153,7 +153,7 @@ def get_dist_from_file(file_path):
 @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
 @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
 @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['random_train', 'random_fixed', 'four_train', 'four_fixed', 'random_dynamic']), default="four_train", show_default=True)
+@click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['random_train', 'random_fixed', 'four_train', 'four_fixed']), default="four_train", show_default=True)
 @click.option('--fdim-base',    help='Frequency dimension scale factor', metavar='INT',         type=click.IntRange(min=1), default=8, show_default=True)
 @click.option('--fdim-max',     help='Maximum frequency dimension', metavar='INT',              type=click.IntRange(min=64), default=512, show_default=True)
 @click.option('--sort-dist',    help='Sort frequency set when initialize', metavar='BOOL',      type=bool, default=True, show_default=True)
@@ -161,10 +161,8 @@ def get_dist_from_file(file_path):
 
 # Misc settings.
 @click.option('--desc',         help='String to include in result dir name', metavar='STR',     type=str)
-@click.option('--metrics',      help='Quality metrics', metavar='[NAME|A,B,C|none]',            type=parse_comma_separated_list, default='fid50k_full', show_default=True)
-@click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
-@click.option('--tick',         help='How often to print progress', metavar='KIMG',             type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--snap',         help='How often to save snapshots', metavar='TICKS',            type=click.IntRange(min=1), default=50, show_default=True)
+@click.option('--step',         help='Total training step duration', metavar='STEP',            type=click.IntRange(min=1), default=1, show_default=True)
+# @click.option('--kimg',         help='Total training duration', metavar='KIMG',                 type=click.IntRange(min=1), default=25000, show_default=True)
 @click.option('--seed',         help='Random seed', metavar='INT',                              type=click.IntRange(min=0), default=0, show_default=True)
 @click.option('--fp32',         help='Disable mixed-precision', metavar='BOOL',                 type=bool, default=False, show_default=True)
 @click.option('--nobench',      help='Disable cuDNN benchmarking', metavar='BOOL',              type=bool, default=False, show_default=True)
@@ -223,11 +221,7 @@ def main(**kwargs):
     c.loss_kwargs.r1_gamma = opts.gamma
     c.G_opt_kwargs.lr = (0.002 if 'stylegan2' in opts.cfg else 0.0025) if opts.glr is None else opts.glr
     c.D_opt_kwargs.lr = opts.dlr
-    c.metrics = opts.metrics
-    c.total_kimg = opts.kimg
-    c.kimg_per_tick = opts.tick
-    c.image_snapshot_ticks = 1
-    c.network_snapshot_ticks = opts.snap
+    c.total_step = opts.step
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
 
@@ -238,11 +232,8 @@ def main(**kwargs):
         raise click.ClickException('--batch must be a multiple of --gpus times --batch-gpu')
     if c.batch_gpu < c.D_kwargs.epilogue_kwargs.mbstd_group_size:
         raise click.ClickException('--batch-gpu cannot be smaller than --mbstd')
-    if any(not metric_main.is_valid_metric(metric) for metric in c.metrics):
-        raise click.ClickException('\n'.join(['--metrics can only contain the following values:'] + metric_main.list_valid_metrics()))
 
     # Base configuration.
-    c.ema_kimg = c.batch_size * 10 / 32
     if 'stylegan2' in opts.cfg:
         c.G_kwargs.class_name = 'training.networks_stylegan2.Generator'
         c.loss_kwargs.style_mixing_prob = 0.9 # Enable style mixing regularization.
@@ -270,12 +261,6 @@ def main(**kwargs):
             opts.desc += fdpk_desc
         if 'roll' in opts.cfg:
             c.D_kwargs.class_name = 'training.networks_stylegan3_synth_roll.Discriminator'
-            c.D_kwargs.freq_dist = opts.freq_dist
-            c.D_kwargs.fdim_base = opts.fdim_base
-            c.D_kwargs.fdim_max = opts.fdim_max
-            c.D_kwargs.sort_dist = opts.sort_dist
-        if 'mod' in opts.cfg:
-            c.D_kwargs.class_name = 'training.networks_stylegan3_synth_mod.Discriminator'
             c.D_kwargs.freq_dist = opts.freq_dist
             c.D_kwargs.fdim_base = opts.fdim_base
             c.D_kwargs.fdim_max = opts.fdim_max
@@ -321,7 +306,6 @@ def main(**kwargs):
     if opts.resume is not None:
         c.resume_pkl = opts.resume
         c.ada_kimg = 100 # Make ADA react faster at the beginning.
-        c.ema_rampup = None # Disable EMA rampup.
         c.loss_kwargs.blur_init_sigma = 0 # Disable blur rampup.
 
     # Performance-related toggles.

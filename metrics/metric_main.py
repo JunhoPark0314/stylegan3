@@ -205,3 +205,9 @@ def fid50k_full_crop_32(opts):
     opts.dataset_kwargs.update(max_size=None, xflip=False)
     fid = frechet_inception_distance.compute_crop_fid(opts, max_real=None, num_gen=50000, resolution=32, crop='torchvision.transforms.RandomCrop')
     return dict(fid50k_full_32=fid)
+
+@register_metric
+def fid50k_full_gray(opts):
+    opts.dataset_kwargs.update(max_size=None, xflip=False)
+    fid = frechet_inception_distance.compute_gray_fid(opts, max_real=None, num_gen=50000)
+    return dict(fid50k_full_gray=fid)
