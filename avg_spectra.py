@@ -10,6 +10,7 @@
 or between multiple generators."""
 
 import os
+from random import random
 import numpy as np
 import torch
 import torch.fft
@@ -21,7 +22,66 @@ import dnnlib
 import json
 
 import legacy
+from metrics.metric_utils import FeatureStats
 from training import dataset
+
+def azimuthal_average(image, center=None):
+    # modified to tensor inputs from https://www.astrobetter.com/blog/2010/03/03/fourier-transforms-of-images-in-python/
+    """
+    Calculate the azimuthally averaged radial profile.
+    Requires low frequencies to be at the center of the image.
+    Args:
+        image: Batch of 2D images, NxHxW
+        center: The [x,y] pixel coordinates used as the center. The default is
+             None, which then uses the center of the image (including
+             fracitonal pixels).
+
+    Returns:
+    Azimuthal average over the image around the center
+    """
+    # Check input shapes
+    assert center is None or (len(center) == 2), f'Center has to be None or len(center)=2 ' \
+                                                 f'(but it is len(center)={len(center)}.'
+    # Calculate the indices from the image
+    H, W = image.shape[-2:]
+    h, w = torch.meshgrid(torch.arange(0, H), torch.arange(0, W))
+
+    if center is None:
+        center = torch.tensor([(w.max() - w.min()) / 2.0, (h.max() - h.min()) / 2.0])
+
+    # Compute radius for each pixel wrt center
+    r = torch.stack([w - center[0], h - center[1]]).norm(2, 0)
+
+    # Get sorted radii
+    r_sorted, ind = r.flatten().sort()
+    i_sorted = image.flatten(-2, -1)[..., ind]
+
+    # Get the integer part of the radii (bin size = 1)
+    r_int = r_sorted.long()  # attribute to the smaller integer
+
+    # Find all pixels that fall within each radial bin.
+    deltar = r_int[1:] - r_int[:-1]  # Assumes all radii represented, computes bin change between subsequent radii
+    rind = torch.where(deltar)[0]  # location of changed radius
+
+    # compute number of elements in each bin
+    nind = rind + 1  # number of elements = idx + 1
+    nind = torch.cat([torch.tensor([0]), nind, torch.tensor([H * W])])  # add borders
+    nr = nind[1:] - nind[:-1]  # number of radius bin, i.e. counter for bins belonging to each radius
+
+    # Cumulative sum to figure out sums for each radius bin
+    if H % 2 == 0:
+        raise NotImplementedError('Not sure if implementation correct, please check')
+        rind = torch.cat([torch.tensor([0]), rind, torch.tensor([H * W - 1])])  # add borders
+    else:
+        rind = torch.cat([rind, torch.tensor([H * W - 1])])  # add borders
+    csim = i_sorted.cumsum(-1, dtype=torch.float64)  # integrate over all values with smaller radius
+    tbin = csim[..., rind[1:]] - csim[..., rind[:-1]]
+    # add mean
+    tbin = torch.cat([csim[:, 0:1], tbin], 1)
+
+    radial_prof = tbin / nr.to(tbin.device)  # normalize by counted bins
+
+    return radial_prof
 
 #----------------------------------------------------------------------------
 # Setup an iterator for streaming images, in uint8 NCHW format, based on the
@@ -67,7 +127,8 @@ def construct_heatmap(npz_file, smooth, key='spectrum'):
     npz_data = np.load(npz_file)
     spectrum = npz_data[key]
     image_size = npz_data['image_size']
-    hmap = np.log10(spectrum) * 10 # dB
+    # hmap = np.log10(spectrum) * 10 # dB
+    hmap = np.log10(spectrum) * 10
     hmap = np.fft.fftshift(hmap)
     hmap = np.concatenate([hmap, hmap[:1, :]], axis=0)
     hmap = np.concatenate([hmap, hmap[:, :1]], axis=1)
@@ -82,6 +143,9 @@ def construct_std_heatmap(mean_npz_file, npz_file, smooth, mean_key='spectrum', 
     std_spectrum = np.sqrt(npz_data[std_key])
     mean_spectrum = mean_npz_data[mean_key]
     image_size = npz_data['image_size']
+    # up_hmap = mean_spectrum + std_spectrum
+    # low_hmap = mean_spectrum - std_spectrum
+    
     up_hmap = np.log10(mean_spectrum + std_spectrum) * 10
     low_hmap = np.log10((mean_spectrum - std_spectrum).clip(min=1e-50)) * 10
     # hmap = np.log10(std_spectrum / (mean_spectrum) ** 2 + 1) * 100
@@ -180,6 +244,213 @@ def stats(source, dest, num, seed, device=torch.device('cuda')):
             f.write(jsonl_line + '\n')
 
 #----------------------------------------------------------------------------
+
+@main.command()
+@click.option('--source', help='Network pkl, dataset zip, or directory', metavar='[PKL|ZIP|DIR]', required=True)
+@click.option('--network', help='Network pkl, dataset zip, or directory', metavar='[PKL|ZIP|DIR]', required=True)
+@click.option('--dest', help='Where to store the result', metavar='NPZ', required=True)
+@click.option('--mean', help='Dataset mean for whitening', metavar='FLOAT', type=float, required=True)
+@click.option('--std', help='Dataset standard deviation for whitening', metavar='FLOAT', type=click.FloatRange(min=0), required=True)
+@click.option('--num', help='Number of images to process  [default: all]', metavar='INT', type=click.IntRange(min=1))
+@click.option('--seed', help='Random seed for selecting the images', metavar='INT', type=click.IntRange(min=0), default=0, show_default=True)
+@click.option('--beta', help='Shape parameter for the Kaiser window', metavar='FLOAT', type=click.FloatRange(min=0), default=8, show_default=True)
+@click.option('--interp', help='Frequency-domain interpolation factor', metavar='INT', type=click.IntRange(min=1), default=1, show_default=True)
+def calc_mean_cov(source, network, dest, mean, std, num, seed, beta, interp, device=torch.device('cuda')):
+    """Calculate average power spectrum and store it in .npz file."""
+    torch.multiprocessing.set_start_method('spawn')
+    num_dataset, image_size, image_iter = stream_source_images(source=source, seed=seed, device=device, num=num)
+    num_gen, image_size, generator_iter = stream_source_images(source=network, seed=seed, device=device, num=num)
+    spectrum_size = image_size * interp
+    padding = (spectrum_size - image_size) + 1
+    dataset_stat = FeatureStats(capture_mean_cov=True)
+    generator_stat = FeatureStats(capture_mean_cov=True)
+
+    # Setup window function.
+    window = torch.kaiser_window(image_size, periodic=False, beta=beta, device=device)
+    window *= window.square().sum().rsqrt()
+    window = window.ger(window).unsqueeze(0).unsqueeze(1)
+
+    # Accumulate power spectrum.
+    for image in tqdm.tqdm(image_iter, total=num_dataset):
+        image = (image.to(torch.float64) - mean) / std
+        image = torch.nn.functional.pad(image * window, [0, padding, 0, padding])
+        fft_image = torch.fft.fftshift(torch.fft.fftn(image, dim=[2,3]).abs().square().mean(dim=[0,1]).sqrt())
+        azim_image = azimuthal_average(fft_image.unsqueeze(0))
+        azim_image = azim_image / azim_image[0,0]
+        # aff_len = int(azim_image[0].shape[0] * 0.75)
+        aff_len = 0
+        dataset_stat.append_torch(azim_image[:,aff_len:])
+
+    mu_real, sigma_real = dataset_stat.get_mean_cov()
+    mu_real = torch.tensor(mu_real).cuda()
+    
+    sd = 0
+    for image in tqdm.tqdm(generator_iter, total=num_gen):
+        image = (image.to(torch.float64) - mean) / std
+        image = torch.nn.functional.pad(image * window, [0, padding, 0, padding])
+        fft_image = torch.fft.fftshift(torch.fft.fftn(image, dim=[2,3]).abs().square().mean(dim=[0,1]).sqrt())
+        azim_image = azimuthal_average(fft_image.unsqueeze(0))
+        azim_image = azim_image / azim_image[0,0]
+        # aff_len = int(azim_image[0].shape[0] * 0.75)
+        aff_len = 0
+        sd_i = -(mu_real * torch.log(azim_image + 1e-8) + (1 - mu_real) * (torch.log(1 - azim_image + 1e-8))).mean()
+        assert sd_i.isfinite().item()
+        sd += sd_i
+
+        # generator_stat.append_torch(azim_image[:,aff_len:])
+    sd /= num_gen
+    print(sd)
+    
+    mu_gen, sigma_gen = dataset_stat.get_mean_cov()
+    m = np.square(mu_gen - mu_real).sum()
+    s, _ = scipy.linalg.sqrtm(np.dot(sigma_gen, sigma_real), disp=False) # pylint: disable=no-member
+    fid = np.real(m + np.trace(sigma_gen + sigma_real - s * 2))
+    print(fid)
+
+    # Save result.
+    if os.path.dirname(dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+#----------------------------------------------------------------------------
+
+@main.command()
+@click.option('--source', help='Network pkl, dataset zip, or directory', metavar='[PKL|ZIP|DIR]', required=True)
+@click.option('--network', help='Network pkl, dataset zip, or directory', metavar='[PKL|ZIP|DIR]', required=True)
+@click.option('--mean', help='Where to store the result', metavar='NPZ', required=True)
+@click.option('--dest', help='Where to store the result', metavar='NPZ', required=True)
+@click.option('--num', help='Number of images to process  [default: all]', metavar='INT', type=click.IntRange(min=1))
+@click.option('--beta', help='Shape parameter for the Kaiser window', metavar='FLOAT', type=click.FloatRange(min=0), default=8, show_default=True)
+@click.option('--interp', help='Frequency-domain interpolation factor', metavar='INT', type=click.IntRange(min=1), default=1, show_default=True)
+def calc_feat_std(source, network, mean, dest, num, beta, interp, device=torch.device('cuda')):
+    """Calculate average power spectrum and store it in .npz file."""
+    torch.multiprocessing.set_start_method('spawn')
+    mean_dict = np.load(mean)
+    key_list = [k.split('.')[0] for k in mean_dict._files]
+    spectrum_mean_dict = {k: torch.tensor(mean_dict[k]).cuda() for k in key_list}
+
+    seed = int(random() * 10000)
+    num_images, image_size, image_iter = stream_source_images(source=source, num=num, seed=seed, device=device)
+    mean = 127.5
+    std = 127.5
+
+    with dnnlib.util.open_url(network) as f:
+        D = legacy.load_network_pkl(f)['D'].to(device)
+
+    spectrum_size = image_size * interp
+    padding = (spectrum_size - image_size)
+
+
+    num_spectrum = 1 + len(D.block_resolutions)
+
+    # Setup window function.
+    window_dict = {}
+    spectrum_dict = {}
+    
+    window = torch.kaiser_window(image_size, periodic=False, beta=beta, device=device)
+    window *= window.square().sum().rsqrt()
+    window = window.ger(window).unsqueeze(0).unsqueeze(1)
+    window_dict["image"] = window
+    spectrum_dict["image"] = torch.zeros([spectrum_size, spectrum_size], dtype=torch.float64, device=device)
+
+    for res in D.block_resolutions:
+        window = torch.kaiser_window(res//2, periodic=False, beta=beta, device=device)
+        window *= window.square().sum().rsqrt()
+        window = window.ger(window).unsqueeze(0).unsqueeze(1)
+        window_dict[res] = window
+        spectrum_dict[f'{res}'] = torch.zeros([res//2, res//2], dtype=torch.float64, device=device)
+
+    # Accumulate power spectrum.
+    for image in tqdm.tqdm(image_iter, total=num_images):
+        image = (image - mean) / std
+        image64 = image.to(torch.float64)
+        image64 = torch.nn.functional.pad(image64 * window_dict["image"], [0, padding, 0, padding])
+        mag_image = torch.fft.fftn(image64, dim=[2,3]).abs()
+        spectrum_dict["image"] += (mag_image - spectrum_mean_dict["image"]).square().mean(dim=[0,1])
+        x = None
+        for i, res in enumerate(D.block_resolutions):
+            block = getattr(D, f'b{res}')
+            x, image = block(x, image)
+            x64 = x.to(torch.float64)
+            x64 = torch.nn.functional.pad(x64 * window_dict[res], [0, padding, 0, padding])
+            mag_x = torch.fft.fftn(x64, dim=[2,3]).abs()
+            spectrum_dict[f'{res}'] += (mag_x - spectrum_mean_dict[f'{res}']).square().mean(dim=[0,1])
+
+    for k in list(spectrum_dict.keys()):
+        spectrum_dict[k] = spectrum_dict[k].cpu().numpy() / num_images
+
+    # Save result.
+    if os.path.dirname(dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+    np.savez(dest, image_size=image_size, **spectrum_dict)
+
+#----------------------------------------------------------------------------
+
+@main.command()
+@click.option('--source', help='Network pkl, dataset zip, or directory', metavar='[PKL|ZIP|DIR]', required=True)
+@click.option('--network', help='Network pkl, dataset zip, or directory', metavar='[PKL|ZIP|DIR]', required=True)
+@click.option('--dest', help='Where to store the result', metavar='NPZ', required=True)
+@click.option('--num', help='Number of images to process  [default: all]', metavar='INT', type=click.IntRange(min=1))
+@click.option('--beta', help='Shape parameter for the Kaiser window', metavar='FLOAT', type=click.FloatRange(min=0), default=8, show_default=True)
+@click.option('--interp', help='Frequency-domain interpolation factor', metavar='INT', type=click.IntRange(min=1), default=1, show_default=True)
+def calc_feat_mean(source, network, dest, num, beta, interp, device=torch.device('cuda')):
+    """Calculate average power spectrum and store it in .npz file."""
+    torch.multiprocessing.set_start_method('spawn')
+    seed = int(random() * 10000)
+    num_images, image_size, image_iter = stream_source_images(source=source, num=num, seed=seed, device=device)
+    mean = 127.5
+    std = 127.5
+
+    with dnnlib.util.open_url(network) as f:
+        D = legacy.load_network_pkl(f)['D'].to(device)
+
+    spectrum_size = image_size * interp
+    padding = (spectrum_size - image_size)
+
+
+    num_spectrum = 1 + len(D.block_resolutions)
+
+    # Setup window function.
+    window_dict = {}
+    spectrum_dict = {}
+    
+    window = torch.kaiser_window(image_size, periodic=False, beta=beta, device=device)
+    window *= window.square().sum().rsqrt()
+    window = window.ger(window).unsqueeze(0).unsqueeze(1)
+    window_dict["image"] = window
+    spectrum_dict["image"] = torch.zeros([spectrum_size, spectrum_size], dtype=torch.float64, device=device)
+
+    for res in D.block_resolutions:
+        window = torch.kaiser_window(res//2, periodic=False, beta=beta, device=device)
+        window *= window.square().sum().rsqrt()
+        window = window.ger(window).unsqueeze(0).unsqueeze(1)
+        window_dict[res] = window
+        spectrum_dict[f'{res}'] = torch.zeros([res//2, res//2], dtype=torch.float64, device=device)
+
+    # Accumulate power spectrum.
+    for image in tqdm.tqdm(image_iter, total=num_images):
+        image = (image - mean) / std
+        image64 = image.to(torch.float64)
+        image64 = torch.nn.functional.pad(image64 * window_dict["image"], [0, padding, 0, padding])
+        spectrum_dict["image"] += torch.fft.fftn(image64, dim=[2,3]).abs().mean(dim=[0, 1])
+        x = None
+        for i, res in enumerate(D.block_resolutions):
+            block = getattr(D, f'b{res}')
+            x, image = block(x, image)
+            x64 = x.to(torch.float64)
+            x64 = torch.nn.functional.pad(x64 * window_dict[res], [0, padding, 0, padding])
+            spectrum_dict[f'{res}'] += torch.fft.fftn(x64, dim=[2,3]).abs().mean(dim=[0, 1])
+
+
+    for k in list(spectrum_dict.keys()):
+        spectrum_dict[k] = spectrum_dict[k].cpu().numpy() / num_images
+
+    # Save result.
+    if os.path.dirname(dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+    np.savez(dest, image_size=image_size, **spectrum_dict)
+
+#----------------------------------------------------------------------------
+
 
 @main.command()
 @click.option('--source', help='Network pkl, dataset zip, or directory', metavar='[PKL|ZIP|DIR]', required=True)
@@ -359,11 +630,20 @@ def heatmap(npz_file, save, smooth, dpi):
 @click.option('--save', help='Save the plot and exit', metavar='[PNG|PDF|...]')
 @click.option('--dpi', help='Figure resolution', metavar='FLOAT', type=click.FloatRange(min=1), default=100, show_default=True)
 @click.option('--smooth', help='Amount of smoothing', metavar='FLOAT', type=click.FloatRange(min=0), default=0, show_default=True)
-def slices(npz_files, save, dpi, smooth):
+@click.option('--key', help='Figure resolution' , default="image", show_default=True)
+@click.option('--ymax', help='Figure resolution', default=7.5, show_default=True)
+@click.option('--ymin', help='Figure resolution', default=0, show_default=True)
+def slices(npz_files, save, dpi, smooth, key, ymin, ymax):
     """Visualize 1D slices based on the given .npz files."""
     cases = [dnnlib.EasyDict(npz_file=npz_file) for npz_file in npz_files]
+    ymax = 0
+    ymin = 0
     for c in cases:
-        c.hmap, c.image_size = construct_heatmap(npz_file=c.npz_file, smooth=smooth)
+        c.hmap, c.image_size = construct_heatmap(npz_file=c.npz_file, smooth=smooth, key=key)
+        if c.hmap.max() > ymax:
+            ymax = c.hmap.max()
+        if c.hmap.min() < ymin:
+            ymin = c.hmap.min()
         c.label = os.path.splitext(os.path.basename(c.npz_file))[0]
 
     # Check consistency.
@@ -380,7 +660,8 @@ def slices(npz_files, save, dpi, smooth):
     freqs45 = np.linspace(0, image_size / np.sqrt(2), num=(hmap_size // 2 + 1), endpoint=True)
     xticks0 = np.linspace(freqs0[0], freqs0[-1], num=9, endpoint=True)
     xticks45 = np.round(np.linspace(freqs45[0], freqs45[-1], num=9, endpoint=True))
-    yticks = np.linspace(-50, 30, num=9, endpoint=True)
+
+    yticks = np.linspace(ymin,ymax, num=9, endpoint=True)
 
     # Draw 0 degree slice.
     plt.subplot(1, 2, 1)
@@ -421,7 +702,9 @@ def slices(npz_files, save, dpi, smooth):
 @click.option('--save', help='Save the plot and exit', metavar='[PNG|PDF|...]')
 @click.option('--dpi', help='Figure resolution', metavar='FLOAT', type=click.FloatRange(min=1), default=100, show_default=True)
 @click.option('--smooth', help='Amount of smoothing', metavar='FLOAT', type=click.FloatRange(min=0), default=0, show_default=True)
-def slices_std(npz_files, save, dpi, smooth):
+@click.option('--ymax', help='Figure resolution', metavar='FLOAT', type=click.FloatRange(min=1), default=15, show_default=True)
+@click.option('--ymin', help='Figure resolution', metavar='FLOAT', type=click.FloatRange(min=1), default=-15, show_default=True)
+def slices_std(npz_files, save, dpi, smooth, ymax, ymin):
     """Visualize 1D slices based on the given .npz files."""
     cases = [dnnlib.EasyDict(npz_file=npz_file) for npz_file in npz_files]
     for c in cases:
@@ -450,7 +733,7 @@ def slices_std(npz_files, save, dpi, smooth):
     y_range = lambda x : np.linspace(hmap_center, hmap_center + np.clip(hmap_center * np.tan(to_angle(x)), a_max=hmap_center, a_min=0), num=hmap_size//2+1, dtype=int)
     freqs = lambda x : np.linspace(0, np.sqrt((y_range(x)[-1] / hmap_center - 1) ** 2 + (x_range(x)[-1] / hmap_center - 1) ** 2), num=(hmap_size // 2 + 1), endpoint=True) * image_size / 2
     xticks = lambda x : np.linspace(freqs(x)[0], freqs(x)[-1], num=9, endpoint=True)
-    yticks = np.linspace(-30, 30, num=9, endpoint=True)
+    yticks = np.linspace(ymin, ymax, num=9, endpoint=True)
 
     period = 1
     plot_info_list = [
@@ -504,16 +787,31 @@ def slices_std(npz_files, save, dpi, smooth):
 
 @main.command()
 @click.argument('npz-files', nargs=-1, required=True)
+@click.option('--key', default="image", required=True)
 @click.option('--save', help='Save the plot and exit', metavar='[PNG|PDF|...]')
 @click.option('--dpi', help='Figure resolution', metavar='FLOAT', type=click.FloatRange(min=1), default=100, show_default=True)
 @click.option('--smooth', help='Amount of smoothing', metavar='FLOAT', type=click.FloatRange(min=0), default=0, show_default=True)
-def slices_diff(npz_files, save, dpi, smooth):
+@click.option('--ymax', help='Figure resolution', metavar='FLOAT', default=15, show_default=True)
+@click.option('--ymin', help='Figure resolution', metavar='FLOAT', default=-15, show_default=True)
+def slices_feat(npz_files, key, save, dpi, smooth, ymax, ymin):
+    ymax = 0
+    ymin = 0
     """Visualize 1D slices based on the given .npz files."""
     cases = [dnnlib.EasyDict(npz_file=npz_file) for npz_file in npz_files]
     for c in cases:
-        c.hmap, c.image_size = construct_heatmap(npz_file=c.npz_file, smooth=smooth, key='spectrum_mean')
+        c.hmap, c.image_size = construct_heatmap(npz_file=c.npz_file, smooth=smooth, key=key)
         c.label = os.path.splitext(os.path.basename(c.npz_file))[0]
-        c.std_hmap, _ = construct_std_heatmap(mean_npz_file=c.npz_file, npz_file=c.npz_file, smooth=smooth, mean_key='spectrum_mean' ,std_key='spectrum_std') 
+        if c.hmap.max() > ymax:
+            ymax = c.hmap.max()
+        if c.hmap.min() < ymin:
+            ymin = c.hmap.min()
+
+        file_name = os.path.basename(c.npz_file)
+        std_file = os.path.join(os.path.dirname(c.npz_file) + "_std", file_name)
+        c.std_up_hmap, c.std_low_hmap, _ = construct_std_heatmap(mean_npz_file=c.npz_file, npz_file=std_file, smooth=smooth, mean_key=key, std_key=key) 
+        c.std_up_hmap = c.std_up_hmap - c.hmap
+        c.std_low_hmap = c.std_low_hmap - c.hmap
+        c.std_hmap = np.concatenate([-c.std_low_hmap[None], c.std_up_hmap[None]], axis=0)
 
     # Check consistency.
     image_size = cases[0].image_size
@@ -530,17 +828,18 @@ def slices_diff(npz_files, save, dpi, smooth):
     y_range = lambda x : np.linspace(hmap_center, hmap_center + np.clip(hmap_center * np.tan(to_angle(x)), a_max=hmap_center, a_min=0), num=hmap_size//2+1, dtype=int)
     freqs = lambda x : np.linspace(0, np.sqrt((y_range(x)[-1] / hmap_center - 1) ** 2 + (x_range(x)[-1] / hmap_center - 1) ** 2), num=(hmap_size // 2 + 1), endpoint=True) * image_size / 2
     xticks = lambda x : np.linspace(freqs(x)[0], freqs(x)[-1], num=9, endpoint=True)
-    yticks = np.linspace(-25, 25, num=9, endpoint=True)
+    yticks = np.linspace(ymin, ymax, num=9, endpoint=True)
 
+    period = 1
     plot_info_list = [
         # angle, period
-        (0, 3),
-        (15, 3),
-        (30, 3),
-        (45, 3),
-        (60, 3), 
-        (75, 3), 
-        (90, 3),
+        (0, period),
+        (15, period),
+        (30, period),
+        (45, period),
+        (60, period), 
+        (75, period), 
+        (90, period),
     ]
 
     px = 2
@@ -554,18 +853,22 @@ def slices_diff(npz_files, save, dpi, smooth):
         i_xrange = x_range(i_angle)
         i_yrange = y_range(i_angle)
 
+        # st_idx = int(len(i_freqs) * 0.8)
+        st_idx = 0
         plt.subplot(py, px, i + 1)
         plt.title(f'{i_angle}\u00b0 slice')
         plt.xlim(i_xticks[0], i_xticks[-1])
         plt.ylim(i_yticks[0], i_yticks[-1])
-        plt.xticks(i_xticks)
+        plt.xticks(i_xticks[0:])
         plt.yticks(i_yticks)
+
         for c in cases:
-            markers, caps, bars = plt.errorbar(i_freqs[::i_period], c.hmap[i_xrange[::i_period], i_yrange[::i_period]], c.std_hmap[i_xrange[::i_period], i_yrange[::i_period]], label=c.label)
+
+            markers, caps, bars = plt.errorbar(i_freqs[st_idx::i_period], c.hmap[i_xrange[st_idx::i_period], i_yrange[st_idx::i_period]], c.std_hmap[:,i_xrange[st_idx::i_period], i_yrange[st_idx::i_period]], label=c.label)
             [bar.set_alpha(0.5) for bar in bars]
             [cap.set_alpha(0.5) for cap in caps]
         plt.grid()
-        plt.legend(loc='upper right')
+        plt.legend(loc='lower left')
 
     # Display or save.
     if save is None:

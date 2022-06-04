@@ -153,7 +153,7 @@ def get_dist_from_file(file_path):
 @click.option('--dlr',          help='D learning rate', metavar='FLOAT',                        type=click.FloatRange(min=0), default=0.002, show_default=True)
 @click.option('--map-depth',    help='Mapping network depth  [default: varies]', metavar='INT', type=click.IntRange(min=1))
 @click.option('--mbstd-group',  help='Minibatch std group size', metavar='INT',                 type=click.IntRange(min=1), default=4, show_default=True)
-@click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['uniform', 'low_biased', 'trainable', 'data-driven']), default="uniform", show_default=True)
+@click.option('--freq-dist',    help='Frequency distribution config',                           type=click.Choice(['random_train', 'random_fixed', 'four_train', 'four_fixed', "random_dynamic"]), default="random_train", show_default=True)
 @click.option('--fdim-base',    help='Frequency dimension scale factor', metavar='INT',         type=click.IntRange(min=1), default=8, show_default=True)
 @click.option('--fdim-max',     help='Maximum frequency dimension', metavar='INT',              type=click.IntRange(min=64), default=512, show_default=True)
 @click.option('--sort-dist',    help='Sort frequency set when initialize', metavar='BOOL',      type=bool, default=True, show_default=True)
@@ -217,11 +217,11 @@ def main(**kwargs):
     c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
     c.G_kwargs.channel_base = c.D_kwargs.channel_base = opts.cbase
     c.G_kwargs.channel_max = c.D_kwargs.channel_max = opts.cmax
-    c.G_kwargs.mapping_kwargs.num_layers = (8 if opts.cfg == 'stylegan2' else 2) if opts.map_depth is None else opts.map_depth
+    c.G_kwargs.mapping_kwargs.num_layers = (8 if 'stylegan2' in opts.cfg else 2) if opts.map_depth is None else opts.map_depth
     c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
     c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.mbstd_group
     c.loss_kwargs.r1_gamma = opts.gamma
-    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
+    c.G_opt_kwargs.lr = (0.002 if 'stylegan2' in opts.cfg else 0.0025) if opts.glr is None else opts.glr
     c.D_opt_kwargs.lr = opts.dlr
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
